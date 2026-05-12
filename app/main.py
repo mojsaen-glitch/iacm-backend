@@ -13,9 +13,12 @@ from app.websockets.manager import ws_manager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Create upload directories
-    for subdir in ["crew_photos", "documents", "training"]:
-        os.makedirs(os.path.join(settings.UPLOAD_DIR, subdir), exist_ok=True)
+    # Create upload directories (skip silently if filesystem is read-only, e.g. Vercel)
+    try:
+        for subdir in ["crew_photos", "documents", "training"]:
+            os.makedirs(os.path.join(settings.UPLOAD_DIR, subdir), exist_ok=True)
+    except OSError:
+        pass
 
     # Test Supabase connection
     try:
