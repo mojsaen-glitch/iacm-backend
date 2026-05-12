@@ -1,4 +1,5 @@
 from pydantic import BaseModel, EmailStr
+from typing import Optional
 
 
 class LoginRequest(BaseModel):
@@ -35,3 +36,23 @@ class CurrentUserResponse(BaseModel):
     crew_id: str | None = None
     is_active: bool
     avatar_path: str | None = None
+
+
+class CreateUserRequest(BaseModel):
+    email: EmailStr
+    password: str
+    name_ar: str
+    name_en: str
+    role: str  # admin, ops_manager, scheduler, crew_allocator, compliance_officer, crew
+    company_id: Optional[str] = None  # if None, inherit from creator
+
+
+class UserListItem(BaseModel):
+    id: str
+    email: str
+    name_ar: str
+    name_en: str
+    role: str
+    is_active: bool
+    company_id: str
+    last_login: Optional[str] = None

@@ -1,9 +1,13 @@
 from fastapi import APIRouter
-from datetime import datetime, timezone, timedelta
-from app.api.deps import SbClient, CurrentUser
-from app.schemas.auth import LoginRequest, TokenResponse, RefreshTokenRequest, CurrentUserResponse
-from app.core.security import verify_password, create_access_token, create_refresh_token, decode_token
-from app.core.exceptions import UnauthorizedError
+from datetime import datetime, timezone
+from typing import List
+from app.api.deps import SbClient, CurrentUser, AdminOnly
+from app.schemas.auth import (
+    LoginRequest, TokenResponse, RefreshTokenRequest,
+    CurrentUserResponse, CreateUserRequest, UserListItem,
+)
+from app.core.security import verify_password, get_password_hash, create_access_token, create_refresh_token, decode_token
+from app.core.exceptions import UnauthorizedError, ForbiddenError
 from app.core.config import settings
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -74,4 +78,90 @@ async def get_me(current_user: CurrentUser):
         crew_id=current_user.get("crew_id"),
         is_active=current_user["is_active"],
         avatar_path=current_user.get("avatar_path"),
+    )
+
+
+# ── User Management (admin only) ──────────────────────────────
+
+@router.get("/users", response_model=List[UserListItem])
+async def list_users(current_user: CurrentUser, sb: SbClient):
+    """List all users in the same company. Admin/super_admin only."""
+    if current_user["role"] not in ("super_admin", "admin"):
+        raise ForbiddenError("Admin access required")
+
+    result = sb.table("users") \
+        .select("id,email,name_ar,name_en,role,is_active,company_id,last_login") \
+        .eq("company_id", current_user["company_id"]) \
+        .order("name_ar") \
+        .execute()
+
+    return [UserListItem(**u) for u in result.data]
+
+
+@router.post("/users", response_model=UserListItem, status_code=201)
+async def create_user(data: CreateUserRequest, current_user: CurrentUser, sb: SbClient):
+    """Create a new system user. Admin/super_admin only."""
+    if current_user["role"] not in ("super_admin", "admin"):
+        raise ForbiddenError("Admin access required")
+
+    # Check email uniqueness
+    existing = sb.table("users").select("id").eq("email", data.email).execute()
+    if existing.data:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=409, detail="البريد الإلكتروني مستخدم بالفعل")
+
+    company_id = data.company_id or current_user["company_id"]
+
+    new_user = {
+        "email": data.email,
+        "hashed_password": get_password_hash(data.password),
+        "name_ar": data.name_ar,
+        "name_en": data.name_en,
+        "role": data.role,
+        "company_id": company_id,
+        "is_active": True,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    result = sb.table("users").insert(new_user).execute()
+    created = result.data[0]
+
+    return UserListItem(
+        id=created["id"],
+        email=created["email"],
+        name_ar=created["name_ar"],
+        name_en=created["name_en"],
+        role=created["role"],
+        is_active=created["is_active"],
+        company_id=created["company_id"],
+        last_login=created.get("last_login"),
+    )
+
+
+@router.patch("/users/{user_id}/toggle", response_model=UserListItem)
+async def toggle_user_active(user_id: str, current_user: CurrentUser, sb: SbClient):
+    """Activate or deactivate a user. Admin only."""
+    if current_user["role"] not in ("super_admin", "admin"):
+        raise ForbiddenError("Admin access required")
+
+    # Cannot deactivate self
+    if user_id == current_user["id"]:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="لا يمكنك تعطيل حسابك الخاص")
+
+    result = sb.table("users").select("*").eq("id", user_id) \
+        .eq("company_id", current_user["company_id"]).execute()
+    if not result.data:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="المستخدم غير موجود")
+
+    user = result.data[0]
+    new_status = not user["is_active"]
+    updated = sb.table("users").update({"is_active": new_status}).eq("id", user_id).execute()
+    u = updated.data[0]
+
+    return UserListItem(
+        id=u["id"], email=u["email"], name_ar=u["name_ar"], name_en=u["name_en"],
+        role=u["role"], is_active=u["is_active"], company_id=u["company_id"],
+        last_login=u.get("last_login"),
     )
