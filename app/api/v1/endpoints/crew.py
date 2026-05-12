@@ -112,3 +112,55 @@ async def unblock_crew(crew_id: str, current_user: CurrentUser, sb: SbClient):
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", crew_id).execute()
     return result.data[0] if result.data else {}
+
+
+@router.post("/{crew_id}/create-account")
+async def create_crew_account(crew_id: str, current_user: CurrentUser, sb: SbClient):
+    """Auto-create a system login account for a crew member. Admin only."""
+    from app.core.security import get_password_hash
+    from fastapi import HTTPException
+
+    if current_user["role"] not in ("super_admin", "admin"):
+        raise ForbiddenError("Admin access required")
+
+    # Get crew member
+    res = sb.table("crew").select("*").eq("id", crew_id).eq("company_id", current_user["company_id"]).execute()
+    if not res.data:
+        raise NotFoundError("Crew member", crew_id)
+    crew = res.data[0]
+
+    employee_id = crew.get("employee_id", "").strip()
+    if not employee_id:
+        raise HTTPException(status_code=400, detail="الرقم الوظيفي مطلوب لإنشاء الحساب")
+
+    # Generate credentials
+    email = f"{employee_id.lower()}@iraqiairways.iq"
+    password = f"IA@{employee_id}"
+
+    # Check if account already exists
+    existing = sb.table("users").select("id,email").eq("email", email).execute()
+    if existing.data:
+        # Return existing account info
+        return {"email": email, "password": None, "already_exists": True, "user_id": existing.data[0]["id"]}
+
+    # Create the user account
+    new_user = {
+        "email": email,
+        "hashed_password": get_password_hash(password),
+        "name_ar": crew.get("full_name_ar", ""),
+        "name_en": crew.get("full_name_en", ""),
+        "role": "crew",
+        "company_id": current_user["company_id"],
+        "crew_id": crew_id,
+        "is_active": True,
+        "created_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+    }
+    result = sb.table("users").insert(new_user).execute()
+    user = result.data[0] if result.data else {}
+
+    return {
+        "email": email,
+        "password": password,
+        "already_exists": False,
+        "user_id": user.get("id"),
+    }
