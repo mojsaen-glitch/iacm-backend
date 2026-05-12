@@ -1,11 +1,53 @@
 import uuid
 from datetime import datetime, timezone
-from fastapi import APIRouter
+from typing import Optional
+from fastapi import APIRouter, Query
 from app.api.deps import SbClient, CurrentUser
 from app.core.exceptions import NotFoundError, ConflictError, FTLViolationError, CrewBlockedError
 from app.core.config import settings
 
 router = APIRouter(prefix="/assignments", tags=["Crew Assignments"])
+
+
+@router.get("")
+async def get_assignments(
+    current_user: CurrentUser,
+    sb: SbClient,
+    flight_id: Optional[str] = Query(None),
+    crew_id: Optional[str] = Query(None),
+    from_date: Optional[str] = Query(None),
+    to_date: Optional[str] = Query(None),
+    page_size: int = Query(100),
+):
+    """Get assignments filtered by flight_id or crew_id with optional date range."""
+    query = sb.table("assignments").select(
+        "*, flights(flight_number, origin, destination, departure_time, arrival_time, duration_hours, aircraft_type, status)"
+    )
+
+    if flight_id:
+        query = query.eq("flight_id", flight_id)
+    if crew_id:
+        query = query.eq("crew_id", crew_id)
+
+    result = query.limit(page_size).execute()
+    rows = result.data or []
+
+    # Apply date filtering in Python (Supabase FK join doesn't support date filters easily)
+    if from_date or to_date:
+        filtered = []
+        for row in rows:
+            flight = row.get("flights") or {}
+            dep = flight.get("departure_time", "")
+            if dep:
+                dep_date = dep[:10]  # YYYY-MM-DD
+                if from_date and dep_date < from_date:
+                    continue
+                if to_date and dep_date > to_date:
+                    continue
+            filtered.append(row)
+        rows = filtered
+
+    return rows
 
 
 @router.post("", status_code=201)
