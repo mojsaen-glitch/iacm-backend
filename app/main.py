@@ -96,6 +96,17 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
         ws_manager.disconnect(user_id, company_id, websocket)
 
 
+@app.get("/")
+async def root():
+    return {
+        "app": settings.APP_NAME,
+        "version": settings.APP_VERSION,
+        "status": "online",
+        "docs": "/api/docs",
+        "health": "/health",
+    }
+
+
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "version": settings.APP_VERSION, "db": "supabase"}
