@@ -20,34 +20,44 @@ async def get_assignments(
     page_size: int = Query(100),
 ):
     """Get assignments filtered by flight_id or crew_id with optional date range."""
-    query = sb.table("assignments").select(
-        "*, flights(flight_number, origin, destination, departure_time, arrival_time, duration_hours, aircraft_type, status)"
-    )
-
+    # Step 1: get assignments
+    q = sb.table("assignments").select("*")
     if flight_id:
-        query = query.eq("flight_id", flight_id)
+        q = q.eq("flight_id", flight_id)
     if crew_id:
-        query = query.eq("crew_id", crew_id)
-
-    result = query.limit(page_size).execute()
+        q = q.eq("crew_id", crew_id)
+    result = q.limit(page_size).execute()
     rows = result.data or []
 
-    # Apply date filtering in Python (Supabase FK join doesn't support date filters easily)
-    if from_date or to_date:
-        filtered = []
-        for row in rows:
-            flight = row.get("flights") or {}
-            dep = flight.get("departure_time", "")
-            if dep:
-                dep_date = dep[:10]  # YYYY-MM-DD
-                if from_date and dep_date < from_date:
-                    continue
-                if to_date and dep_date > to_date:
-                    continue
-            filtered.append(row)
-        rows = filtered
+    if not rows:
+        return []
 
-    return rows
+    # Step 2: fetch flight details for each unique flight_id
+    flight_ids = list({r["flight_id"] for r in rows if r.get("flight_id")})
+    flights_map = {}
+    if flight_ids:
+        fres = sb.table("flights").select("*").in_("id", flight_ids).execute()
+        for f in (fres.data or []):
+            flights_map[f["id"]] = f
+
+    # Step 3: merge and apply date filter
+    output = []
+    for row in rows:
+        flight = flights_map.get(row.get("flight_id"), {})
+        row["flights"] = flight
+
+        # Date filter
+        dep = flight.get("departure_time", "")
+        if dep and (from_date or to_date):
+            dep_date = dep[:10]
+            if from_date and dep_date < from_date:
+                continue
+            if to_date and dep_date > to_date:
+                continue
+
+        output.append(row)
+
+    return output
 
 
 @router.post("", status_code=201)
