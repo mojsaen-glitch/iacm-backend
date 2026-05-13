@@ -32,6 +32,7 @@ class CurrentUserResponse(BaseModel):
     name_ar: str
     name_en: str
     role: str
+    crew_department: Optional[str] = None  # cabin | cockpit | ground
     company_id: str
     crew_id: str | None = None
     is_active: bool
@@ -43,7 +44,10 @@ class CreateUserRequest(BaseModel):
     password: str
     name_ar: str
     name_en: str
-    role: str  # admin, ops_manager, scheduler, crew_allocator, compliance_officer, crew
+    role: str  # admin | ops_manager | scheduler | crew_allocator
+               # cabin_allocator | cockpit_allocator | ground_allocator
+               # compliance_officer | crew
+    crew_department: Optional[str] = None  # cabin | cockpit | ground (for allocators)
     company_id: Optional[str] = None  # if None, inherit from creator
 
 

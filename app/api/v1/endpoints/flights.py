@@ -82,8 +82,74 @@ async def update_flight(flight_id: str, data: dict, current_user: CurrentUser, s
 
 @router.post("/{flight_id}/publish")
 async def publish_flight(flight_id: str, current_user: CurrentUser, sb: SbClient):
-    existing = sb.table("flights").select("id").eq("id", flight_id).eq("company_id", current_user["company_id"]).execute()
-    if not existing.data:
+    """
+    Publish a flight for crew assignment.
+    - Changes publish_status to 'published'
+    - Sends in-app notification to all allocators in the same company
+    """
+    flight_res = sb.table("flights").select("*") \
+        .eq("id", flight_id).eq("company_id", current_user["company_id"]).execute()
+    if not flight_res.data:
         raise NotFoundError("Flight", flight_id)
-    result = sb.table("flights").update({"publish_status": "published", "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", flight_id).execute()
-    return result.data[0] if result.data else {}
+    flight = flight_res.data[0]
+
+    if flight.get("publish_status") == "published":
+        return flight  # already published
+
+    # Update flight
+    updated = sb.table("flights").update({
+        "publish_status": "published",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", flight_id).execute()
+
+    # Notify all allocators (cabin + cockpit + ground + crew_allocator)
+    allocator_roles = [
+        "crew_allocator", "cabin_allocator",
+        "cockpit_allocator", "ground_allocator",
+        "ops_manager", "admin",
+    ]
+    users_res = sb.table("users").select("id,role") \
+        .eq("company_id", current_user["company_id"]) \
+        .eq("is_active", True).execute()
+
+    flight_num = flight.get("flight_number", "")
+    dep        = flight.get("departure_time", "")[:16].replace("T", " ")
+    origin     = flight.get("origin_code", "")
+    dest       = flight.get("destination_code", "")
+    msg_ar     = f"رحلة جديدة تحتاج تكليف طاقم: {flight_num} ({origin}→{dest}) في {dep}"
+    msg_en     = f"New flight needs crew assignment: {flight_num} ({origin}→{dest}) at {dep}"
+
+    notifs = []
+    for u in (users_res.data or []):
+        if u["role"] in allocator_roles:
+            notifs.append({
+                "id":          str(uuid.uuid4()),
+                "user_id":     u["id"],
+                "type":        "flight_published",
+                "title_ar":    "رحلة جديدة للتكليف",
+                "title_en":    "New Flight for Assignment",
+                "message_ar":  msg_ar,
+                "message_en":  msg_en,
+                "reference_id": flight_id,
+                "reference_type": "flight",
+                "is_read":     False,
+                "created_at":  datetime.now(timezone.utc).isoformat(),
+            })
+    if notifs:
+        sb.table("notifications").insert(notifs).execute()
+
+    return updated.data[0] if updated.data else flight
+
+
+@router.get("/pending-assignment")
+async def get_flights_pending_assignment(current_user: CurrentUser, sb: SbClient):
+    """
+    Returns published flights that still need crew assigned.
+    Department allocators see this filtered to their relevance.
+    """
+    result = sb.table("flights").select("*") \
+        .eq("company_id", current_user["company_id"]) \
+        .eq("publish_status", "published") \
+        .neq("status", "cancelled") \
+        .order("departure_time", desc=False).execute()
+    return result.data or []

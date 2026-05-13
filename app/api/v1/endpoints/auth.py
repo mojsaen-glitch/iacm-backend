@@ -74,6 +74,7 @@ async def get_me(current_user: CurrentUser):
         name_ar=current_user["name_ar"],
         name_en=current_user["name_en"],
         role=current_user["role"],
+        crew_department=current_user.get("crew_department"),
         company_id=current_user["company_id"],
         crew_id=current_user.get("crew_id"),
         is_active=current_user["is_active"],
@@ -112,12 +113,23 @@ async def create_user(data: CreateUserRequest, current_user: CurrentUser, sb: Sb
 
     company_id = data.company_id or current_user["company_id"]
 
+    # Auto-assign crew_department based on role
+    crew_department = data.crew_department
+    if not crew_department:
+        if data.role == "cabin_allocator":
+            crew_department = "cabin"
+        elif data.role == "cockpit_allocator":
+            crew_department = "cockpit"
+        elif data.role == "ground_allocator":
+            crew_department = "ground"
+
     new_user = {
         "email": data.email,
         "hashed_password": get_password_hash(data.password),
         "name_ar": data.name_ar,
         "name_en": data.name_en,
         "role": data.role,
+        "crew_department": crew_department,
         "company_id": company_id,
         "is_active": True,
         "created_at": datetime.now(timezone.utc).isoformat(),

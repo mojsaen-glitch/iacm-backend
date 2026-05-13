@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from fastapi import APIRouter, Query
 from app.api.deps import SbClient, CurrentUser
-from app.core.exceptions import NotFoundError, ConflictError, FTLViolationError, CrewBlockedError
+from app.core.exceptions import NotFoundError, ConflictError, FTLViolationError, CrewBlockedError, ForbiddenError
 from app.core.config import settings
 from app.core.compliance_engine import ComplianceEngine, IRAQI_AIRPORTS
 
@@ -79,6 +79,23 @@ async def assign_crew(data: dict, current_user: CurrentUser, sb: SbClient):
         raise NotFoundError("Crew member", crew_id)
     crew = crew_res.data[0]
 
+    # ── Department restriction check ─────────────────────────
+    # cabin_allocator can only assign cabin crew, cockpit_allocator only pilots, etc.
+    user_role = current_user.get("role", "")
+    crew_dept  = current_user.get("crew_department", "")
+    crew_rank  = crew.get("rank", "")
+
+    COCKPIT_RANKS = {"captain", "first_officer", "second_officer", "flight_engineer"}
+    CABIN_RANKS   = {"chief", "purser", "senior", "cabin_crew"}
+    GROUND_RANKS  = {"dispatcher", "ground_staff"}
+
+    if user_role == "cabin_allocator" and crew_rank not in CABIN_RANKS and not is_override:
+        raise ForbiddenError("مخصص الضيافة يمكنه فقط تكليف طاقم المقصورة")
+    if user_role == "cockpit_allocator" and crew_rank not in COCKPIT_RANKS and not is_override:
+        raise ForbiddenError("مخصص القيادة يمكنه فقط تكليف الطيارين")
+    if user_role == "ground_allocator" and crew_rank not in GROUND_RANKS and not is_override:
+        raise ForbiddenError("مخصص الأرضي يمكنه فقط تكليف الطاقم الأرضي")
+
     # Check duplicate
     dup = sb.table("assignments").select("id").eq("flight_id", flight_id).eq("crew_id", crew_id).execute()
     if dup.data:
@@ -122,7 +139,34 @@ async def assign_crew(data: dict, current_user: CurrentUser, sb: SbClient):
     }
 
     result = sb.table("assignments").insert(assignment).execute()
-    return result.data[0] if result.data else {}
+    saved  = result.data[0] if result.data else {}
+
+    # ── Notify the crew member ───────────────────────────────
+    try:
+        # Find the user account linked to this crew member
+        crew_user = sb.table("users").select("id").eq("crew_id", crew_id).execute()
+        if crew_user.data:
+            flight_num = flight.get("flight_number", "")
+            dep_str    = flight.get("departure_time", "")[:16].replace("T", " ")
+            origin     = flight.get("origin_code", "")
+            dest       = flight.get("destination_code", "")
+            sb.table("notifications").insert({
+                "id":           str(uuid.uuid4()),
+                "user_id":      crew_user.data[0]["id"],
+                "type":         "crew_assigned",
+                "title_ar":     "تم تكليفك برحلة",
+                "title_en":     "You have been assigned to a flight",
+                "message_ar":   f"تم تكليفك برحلة {flight_num} ({origin}→{dest}) في {dep_str}",
+                "message_en":   f"You are assigned to flight {flight_num} ({origin}→{dest}) at {dep_str}",
+                "reference_id": flight_id,
+                "reference_type": "flight",
+                "is_read":      False,
+                "created_at":   datetime.now(timezone.utc).isoformat(),
+            }).execute()
+    except Exception:
+        pass  # notification failure should not block assignment
+
+    return saved
 
 
 @router.delete("/{assignment_id}")
