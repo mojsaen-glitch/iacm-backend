@@ -80,6 +80,25 @@ async def update_flight(flight_id: str, data: dict, current_user: CurrentUser, s
     return result.data[0] if result.data else {}
 
 
+@router.put("/{flight_id}")
+async def update_flight_put(flight_id: str, data: dict, current_user: CurrentUser, sb: SbClient):
+    """PUT alias for PATCH — full or partial update."""
+    return await update_flight(flight_id, data, current_user, sb)
+
+
+@router.delete("/{flight_id}", status_code=204)
+async def delete_flight(flight_id: str, current_user: CurrentUser, sb: SbClient):
+    """Delete a flight. Admin / Ops Manager only."""
+    if current_user["role"] not in ("super_admin", "admin", "ops_manager"):
+        raise NotFoundError("Flight", flight_id)
+    existing = sb.table("flights").select("id").eq("id", flight_id).eq("company_id", current_user["company_id"]).execute()
+    if not existing.data:
+        raise NotFoundError("Flight", flight_id)
+    # Remove assignments to avoid FK issues
+    sb.table("assignments").delete().eq("flight_id", flight_id).execute()
+    sb.table("flights").delete().eq("id", flight_id).execute()
+
+
 @router.post("/{flight_id}/publish")
 async def publish_flight(flight_id: str, current_user: CurrentUser, sb: SbClient):
     """

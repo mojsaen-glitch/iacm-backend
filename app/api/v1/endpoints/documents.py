@@ -41,6 +41,38 @@ async def create_document(data: dict, current_user: CurrentUser, sb: SbClient):
     return result.data[0] if result.data else {}
 
 
+@router.patch("/{doc_id}")
+async def update_document(doc_id: str, data: dict, current_user: CurrentUser, sb: SbClient):
+    """Update a document (e.g. expiry date, doc number)."""
+    existing = sb.table("documents").select("id,crew_id").eq("id", doc_id).execute()
+    if not existing.data:
+        raise NotFoundError("Document", doc_id)
+    # Verify crew belongs to same company
+    crew = sb.table("crew").select("id").eq("id", existing.data[0]["crew_id"])\
+        .eq("company_id", current_user["company_id"]).execute()
+    if not crew.data:
+        raise NotFoundError("Document", doc_id)
+    data["updated_at"] = datetime.now(timezone.utc).isoformat()
+    result = sb.table("documents").update(data).eq("id", doc_id).execute()
+    return result.data[0] if result.data else {}
+
+
+@router.delete("/{doc_id}", status_code=204)
+async def delete_document(doc_id: str, current_user: CurrentUser, sb: SbClient):
+    """Delete a document. Admin / Ops Manager only."""
+    if current_user["role"] not in ("super_admin", "admin", "ops_manager"):
+        from app.core.exceptions import ForbiddenError
+        raise ForbiddenError("Insufficient permissions")
+    existing = sb.table("documents").select("id,crew_id").eq("id", doc_id).execute()
+    if not existing.data:
+        raise NotFoundError("Document", doc_id)
+    crew = sb.table("crew").select("id").eq("id", existing.data[0]["crew_id"])\
+        .eq("company_id", current_user["company_id"]).execute()
+    if not crew.data:
+        raise NotFoundError("Document", doc_id)
+    sb.table("documents").delete().eq("id", doc_id).execute()
+
+
 @router.get("/expiring")
 async def get_expiring_documents(
     current_user: CurrentUser,

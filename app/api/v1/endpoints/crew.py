@@ -82,6 +82,25 @@ async def update_crew(crew_id: str, data: dict, current_user: CurrentUser, sb: S
     return result.data[0] if result.data else {}
 
 
+@router.put("/{crew_id}")
+async def update_crew_put(crew_id: str, data: dict, current_user: CurrentUser, sb: SbClient):
+    """PUT alias for PATCH — accepts full or partial update."""
+    return await update_crew(crew_id, data, current_user, sb)
+
+
+@router.delete("/{crew_id}", status_code=204)
+async def delete_crew(crew_id: str, current_user: CurrentUser, sb: SbClient):
+    """Delete a crew member. Admin only."""
+    if current_user["role"] not in ("super_admin", "admin"):
+        raise ForbiddenError("Admin access required")
+    existing = sb.table("crew").select("id").eq("id", crew_id).eq("company_id", current_user["company_id"]).execute()
+    if not existing.data:
+        raise NotFoundError("Crew member", crew_id)
+    # Remove assignments first to avoid FK violations
+    sb.table("assignments").delete().eq("crew_id", crew_id).execute()
+    sb.table("crew").delete().eq("id", crew_id).execute()
+
+
 @router.post("/{crew_id}/block")
 async def block_crew(crew_id: str, data: dict, current_user: CurrentUser, sb: SbClient):
     existing = sb.table("crew").select("id").eq("id", crew_id).eq("company_id", current_user["company_id"]).execute()
