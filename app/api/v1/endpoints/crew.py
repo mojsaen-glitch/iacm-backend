@@ -4,6 +4,7 @@ from fastapi import APIRouter, Query, UploadFile, File
 from app.api.deps import SbClient, CurrentUser
 from app.core.exceptions import NotFoundError, ConflictError, ForbiddenError
 from app.core.config import settings
+from app.core.security import get_password_hash
 from datetime import datetime, timezone
 
 router = APIRouter(prefix="/crew", tags=["Crew Management"])
@@ -46,11 +47,13 @@ async def create_crew(data: dict, current_user: CurrentUser, sb: SbClient):
     if current_user["role"] not in ["super_admin", "admin", "ops_manager"] and not current_user.get("is_superuser"):
         raise ForbiddenError("Insufficient permissions")
 
-    existing = sb.table("crew").select("id").eq("employee_id", data.get("employee_id", "")).execute()
+    employee_id = data.get("employee_id", "").strip()
+    existing = sb.table("crew").select("id").eq("employee_id", employee_id).execute()
     if existing.data:
-        raise ConflictError(f"Employee ID '{data.get('employee_id')}' already exists")
+        raise ConflictError(f"Employee ID '{employee_id}' already exists")
 
-    data["id"] = str(uuid.uuid4())
+    crew_id = str(uuid.uuid4())
+    data["id"] = crew_id
     data["company_id"] = current_user["company_id"]
     data.setdefault("status", "active")
     data.setdefault("monthly_flight_hours", 0)
@@ -60,7 +63,34 @@ async def create_crew(data: dict, current_user: CurrentUser, sb: SbClient):
     data["updated_at"] = datetime.now(timezone.utc).isoformat()
 
     result = sb.table("crew").insert(data).execute()
-    return result.data[0] if result.data else {}
+    crew = result.data[0] if result.data else {}
+
+    # ── Auto-create login account ──────────────────────────────────────────
+    account_info = {"email": None, "password": None, "account_created": False}
+    if employee_id:
+        email    = f"{employee_id.lower()}@iraqiairways.iq"
+        password = f"IA@{employee_id}"
+        # Only create if no account exists yet
+        existing_user = sb.table("users").select("id").eq("email", email).execute()
+        if not existing_user.data:
+            sb.table("users").insert({
+                "id":              str(uuid.uuid4()),
+                "email":           email,
+                "hashed_password": get_password_hash(password),
+                "name_ar":         data.get("full_name_ar", ""),
+                "name_en":         data.get("full_name_en", ""),
+                "role":            "crew",
+                "company_id":      current_user["company_id"],
+                "crew_id":         crew_id,
+                "is_active":       True,
+                "created_at":      datetime.now(timezone.utc).isoformat(),
+            }).execute()
+            account_info = {"email": email, "password": password, "account_created": True}
+        else:
+            account_info = {"email": email, "password": None, "account_created": False}
+
+    crew["account"] = account_info
+    return crew
 
 
 @router.get("/{crew_id}")
@@ -136,7 +166,6 @@ async def unblock_crew(crew_id: str, current_user: CurrentUser, sb: SbClient):
 @router.post("/{crew_id}/create-account")
 async def create_crew_account(crew_id: str, current_user: CurrentUser, sb: SbClient):
     """Auto-create a system login account for a crew member. Admin only."""
-    from app.core.security import get_password_hash
     from fastapi import HTTPException
 
     if current_user["role"] not in ("super_admin", "admin"):
