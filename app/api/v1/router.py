@@ -8,6 +8,7 @@ from app.api.v1.endpoints import (
     notifications,
     documents,
     messages,
+    compliance,
 )
 
 api_router = APIRouter()
@@ -20,3 +21,4 @@ api_router.include_router(dashboard.router)
 api_router.include_router(notifications.router)
 api_router.include_router(documents.router)
 api_router.include_router(messages.router)
+api_router.include_router(compliance.router)

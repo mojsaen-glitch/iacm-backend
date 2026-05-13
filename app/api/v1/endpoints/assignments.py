@@ -5,6 +5,7 @@ from fastapi import APIRouter, Query
 from app.api.deps import SbClient, CurrentUser
 from app.core.exceptions import NotFoundError, ConflictError, FTLViolationError, CrewBlockedError
 from app.core.config import settings
+from app.core.compliance_engine import ComplianceEngine, IRAQI_AIRPORTS
 
 router = APIRouter(prefix="/assignments", tags=["Crew Assignments"])
 
@@ -83,23 +84,29 @@ async def assign_crew(data: dict, current_user: CurrentUser, sb: SbClient):
     if dup.data:
         raise ConflictError(f"Crew member already assigned to flight {flight['flight_number']}")
 
-    # Check blocked
-    if crew["status"] == "blocked" and not is_override:
-        raise CrewBlockedError(crew["full_name_en"], crew.get("block_reason"))
-
-    # FTL Check
+    # ── Full Compliance Check ─────────────────────────────────
     if not is_override:
-        monthly = crew.get("monthly_flight_hours", 0)
-        rolling_28 = crew.get("last_28day_hours", 0)
-        duration = flight.get("duration_hours", 0)
-        max_monthly = crew.get("max_monthly_hours", settings.MAX_MONTHLY_HOURS)
-        violations = []
-        if monthly + duration > max_monthly:
-            violations.append(f"Monthly hours limit: {monthly:.1f} + {duration:.1f} > {max_monthly}")
-        if rolling_28 + duration > 100:
-            violations.append(f"28-day limit: {rolling_28:.1f} + {duration:.1f} > 100h")
-        if violations:
-            raise FTLViolationError("; ".join(violations))
+        dep_str = flight.get("departure_time", "")
+        arr_str = flight.get("arrival_time", "")
+        dep_dt = datetime.fromisoformat(dep_str.replace("Z", "+00:00")) if dep_str else None
+        arr_dt = datetime.fromisoformat(arr_str.replace("Z", "+00:00")) if arr_str else None
+        is_intl = (
+            flight.get("origin_code", "").upper()      not in IRAQI_AIRPORTS or
+            flight.get("destination_code", "").upper() not in IRAQI_AIRPORTS
+        )
+
+        engine = ComplianceEngine(sb)
+        compliance = engine.check_crew(
+            crew_id=crew_id,
+            flight_id=flight_id,
+            flight_departure=dep_dt,
+            flight_arrival=arr_dt,
+            is_international=is_intl,
+        )
+
+        if compliance.get("status") == "BLOCKED":
+            reasons = "; ".join(compliance.get("blocking_reasons", ["Compliance violation"]))
+            raise CrewBlockedError(crew.get("full_name_en", crew_id), reasons)
 
     assignment = {
         "id": str(uuid.uuid4()),
