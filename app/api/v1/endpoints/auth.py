@@ -66,6 +66,37 @@ async def logout(current_user: CurrentUser, sb: SbClient):
     return {"message": "Logged out successfully"}
 
 
+@router.post("/change-password")
+async def change_password(payload: dict, current_user: CurrentUser, sb: SbClient):
+    """Allow authenticated user to change their own password."""
+    old_password = payload.get("old_password", "")
+    new_password = payload.get("new_password", "")
+
+    if not old_password or not new_password:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=422, detail="old_password and new_password are required")
+
+    if len(new_password) < 6:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=422, detail="كلمة المرور يجب أن تكون 6 أحرف على الأقل")
+
+    # Re-fetch user with hashed_password
+    result = sb.table("users").select("hashed_password").eq("id", current_user["id"]).execute()
+    if not result.data:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if not verify_password(old_password, result.data[0]["hashed_password"]):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="كلمة المرور الحالية غير صحيحة")
+
+    sb.table("users").update({
+        "hashed_password": get_password_hash(new_password),
+    }).eq("id", current_user["id"]).execute()
+
+    return {"message": "Password changed successfully"}
+
+
 @router.get("/me", response_model=CurrentUserResponse)
 async def get_me(current_user: CurrentUser):
     return CurrentUserResponse(

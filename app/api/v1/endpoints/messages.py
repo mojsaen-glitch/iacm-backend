@@ -8,14 +8,21 @@ router = APIRouter(prefix="/messages", tags=["Messages"])
 # ── List users available to message ──────────────────────────────────────────
 @router.get("/users")
 async def list_users(current_user: CurrentUser, sb: SbClient):
-    """Return all active users in the same company (excluding self)."""
-    result = sb.table("users") \
+    """Return messageable users.
+    - Crew members: only see admin/ops_manager/scheduler/super_admin in their company.
+    - Staff: see all active users in their company.
+    """
+    query = sb.table("users") \
         .select("id, name_ar, name_en, role, email") \
         .eq("company_id", current_user["company_id"]) \
         .eq("is_active", True) \
-        .neq("id", current_user["id"]) \
-        .order("name_ar") \
-        .execute()
+        .neq("id", current_user["id"])
+
+    # Crew can only message supervisors/managers — not other crew members
+    if current_user.get("role") == "crew":
+        query = query.in_("role", ["super_admin", "admin", "ops_manager", "scheduler"])
+
+    result = query.order("name_ar").execute()
     return result.data
 
 
