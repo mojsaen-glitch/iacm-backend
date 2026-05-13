@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone  # used in send_message
 from fastapi import APIRouter, Query
 from app.api.deps import SbClient, CurrentUser
 
@@ -149,10 +149,8 @@ async def mark_conversation_read(
     sb: SbClient,
 ):
     """Mark all messages FROM other_user TO current_user as read."""
-    now = datetime.now(timezone.utc).isoformat()
     sb.table("messages").update({
         "is_read": True,
-        "read_at": now,
     }) \
         .eq("sender_id", other_user_id) \
         .eq("receiver_id", current_user["id"]) \
