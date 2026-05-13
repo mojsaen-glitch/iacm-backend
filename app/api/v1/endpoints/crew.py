@@ -131,6 +131,33 @@ async def delete_crew(crew_id: str, current_user: CurrentUser, sb: SbClient):
     sb.table("crew").delete().eq("id", crew_id).execute()
 
 
+@router.get("/{crew_id}/flights")
+async def get_crew_flights(crew_id: str, current_user: CurrentUser, sb: SbClient):
+    """Return upcoming flights assigned to this crew member."""
+    existing = sb.table("crew").select("id").eq("id", crew_id)\
+        .eq("company_id", current_user["company_id"]).execute()
+    if not existing.data:
+        raise NotFoundError("Crew member", crew_id)
+
+    # Get flight IDs from assignments
+    assign_res = sb.table("assignments").select("flight_id")\
+        .eq("crew_id", crew_id).execute()
+    flight_ids = [r["flight_id"] for r in (assign_res.data or []) if r.get("flight_id")]
+
+    if not flight_ids:
+        return []
+
+    from datetime import date
+    today = date.today().isoformat()
+    result = sb.table("flights").select("*")\
+        .in_("id", flight_ids)\
+        .eq("company_id", current_user["company_id"])\
+        .neq("status", "cancelled")\
+        .gte("departure_time", today)\
+        .order("departure_time", desc=False).execute()
+    return result.data or []
+
+
 @router.post("/{crew_id}/block")
 async def block_crew(crew_id: str, data: dict, current_user: CurrentUser, sb: SbClient):
     existing = sb.table("crew").select("id").eq("id", crew_id).eq("company_id", current_user["company_id"]).execute()
