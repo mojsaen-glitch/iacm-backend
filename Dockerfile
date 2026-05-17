@@ -15,8 +15,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy source
 COPY . .
 
-# Create upload directory
+# Create upload directory before dropping privileges
 RUN mkdir -p uploads/crew_photos uploads/documents uploads/training
+
+# Drop privileges — run as a non-root user
+RUN useradd --create-home --uid 1000 appuser \
+    && chown -R appuser:appuser /app
+USER appuser
 
 EXPOSE 8000
 

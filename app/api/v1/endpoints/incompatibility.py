@@ -23,7 +23,7 @@ Table: crew_incompatibility
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, HTTPException
 from app.api.deps import SbClient, CurrentUser
 from app.core.exceptions import NotFoundError, ForbiddenError
 
@@ -105,11 +105,9 @@ async def create_request(data: dict, current_user: CurrentUser, sb: SbClient):
 
     target_crew_id = data.get("target_crew_id") or data.get("target_id")
     if not target_crew_id:
-        from fastapi import HTTPException
         raise HTTPException(status_code=400, detail="target_crew_id مطلوب")
 
     if requestor_crew_id == target_crew_id:
-        from fastapi import HTTPException
         raise HTTPException(status_code=400, detail="لا يمكنك تقديم طلب ضد نفسك")
 
     # Check for existing active request
@@ -120,7 +118,6 @@ async def create_request(data: dict, current_user: CurrentUser, sb: SbClient):
         .in_("status", ["pending", "approved"]) \
         .execute()
     if existing.data:
-        from fastapi import HTTPException
         raise HTTPException(status_code=409, detail="طلب مشابه موجود بالفعل")
 
     record = {
@@ -189,7 +186,6 @@ async def review_request(request_id: str, data: dict, current_user: CurrentUser,
 
     action = data.get("action", "").lower()
     if action not in ("approve", "reject"):
-        from fastapi import HTTPException
         raise HTTPException(status_code=400, detail="action يجب أن يكون approve أو reject")
 
     new_status = "approved" if action == "approve" else "rejected"

@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import field_validator
 import json
@@ -16,21 +16,26 @@ class Settings(BaseSettings):
     APP_NAME: str = "IACM - Iraqi Airways Crew Management"
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = False
-    SECRET_KEY: str = "change-this-secret-key-in-production-min-32-chars"
+    SECRET_KEY: str
     API_V1_PREFIX: str = "/api/v1"
     ALLOWED_HOSTS: List[str] = [
         "http://localhost:3000",
         "http://localhost:8080",
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "https://backend-jet-nine-75.vercel.app",
     ]
 
     # Supabase (required)
     SUPABASE_URL: str
     SUPABASE_SERVICE_KEY: str
 
+    # Database (optional — used by SQLAlchemy/Alembic only; primary access is via Supabase client)
+    DATABASE_URL: Optional[str] = None
+    DATABASE_URL_SYNC: Optional[str] = None
+
     # JWT
-    JWT_SECRET_KEY: str = "change-this-jwt-secret-in-production"
+    JWT_SECRET_KEY: str
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
     REFRESH_TOKEN_EXPIRE_DAYS: int = 30

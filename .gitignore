@@ -1,4 +1,11 @@
 .env
+.env.local
+
+# Firebase Admin SDK — NEVER commit these
+secrets/
+*firebase-adminsdk*.json
+*service-account*.json
+
 __pycache__/
 *.pyc
 *.pyo
@@ -17,3 +24,5 @@ uploads/
 htmlcov/
 
 .vercel
+
+.dart_tool/

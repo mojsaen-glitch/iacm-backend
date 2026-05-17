@@ -135,11 +135,7 @@ async def seed(db: AsyncSession):
     print(f"✓ Aircraft: {len(aircraft_list)} registered")
     print(f"✓ Flights: {len(flights)} created")
     print(f"✓ Documents: {len(docs)} created")
-    print("\nLogin credentials:")
-    print("  admin@iraqiairways.iq / admin123")
-    print("  supervisor@iraqiairways.iq / super123")
-    print("  scheduler@iraqiairways.iq / sched123")
-    print("  crew1@iraqiairways.iq / crew123")
+    print("\nSeed completed. Login credentials are defined in this script's source — review it directly.")
 
 
 async def main():

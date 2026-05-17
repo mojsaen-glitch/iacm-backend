@@ -10,6 +10,8 @@ from app.api.v1.endpoints import (
     messages,
     compliance,
     incompatibility,
+    training,
+    leave_requests,
 )
 
 api_router = APIRouter()
@@ -24,3 +26,5 @@ api_router.include_router(documents.router)
 api_router.include_router(messages.router)
 api_router.include_router(compliance.router)
 api_router.include_router(incompatibility.router)
+api_router.include_router(training.router)
+api_router.include_router(leave_requests.router)

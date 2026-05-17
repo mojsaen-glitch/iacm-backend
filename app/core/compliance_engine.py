@@ -17,9 +17,14 @@ Overall status:
 """
 
 from __future__ import annotations
+import logging
 from datetime import datetime, date, timezone, timedelta
 from dataclasses import dataclass, field
 from typing import Optional
+
+from app.core.config import settings
+
+_log = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -39,16 +44,16 @@ class ComplianceStatus:
     BLOCKED = "BLOCKED"  # Blocking violations — cannot assign
 
 
-WARN_DAYS_BEFORE_EXPIRY = 30    # days before expiry to start warning
-MAX_MONTHLY_HOURS       = 90.0  # default crew max monthly hours
-WARN_MONTHLY_HOURS      = 75.0  # warn when approaching monthly limit
-MAX_28DAY_HOURS         = 100.0 # ICAO 28-day rolling limit
-WARN_28DAY_HOURS        = 90.0  # warn when approaching 28-day limit
-MAX_YEARLY_HOURS        = 900.0 # ICAO yearly absolute limit
-WARN_YEARLY_HOURS       = 800.0 # warn when approaching yearly limit
-MIN_REST_DOMESTIC       = 10.0  # ICAO minimum rest hours — domestic
-MIN_REST_INTERNATIONAL  = 12.0  # ICAO minimum rest hours — international
-REST_WARN_BUFFER        = 2.0   # warn when rest is within 2h of minimum
+WARN_DAYS_BEFORE_EXPIRY = 30                              # days before expiry to start warning
+MAX_MONTHLY_HOURS       = settings.MAX_MONTHLY_HOURS      # default crew max monthly hours (single source of truth)
+WARN_MONTHLY_HOURS      = MAX_MONTHLY_HOURS * 0.83        # warn at ~83% of monthly limit
+MAX_28DAY_HOURS         = 100.0                           # ICAO 28-day rolling limit
+WARN_28DAY_HOURS        = MAX_28DAY_HOURS * 0.9           # warn at 90% of 28-day limit
+MAX_YEARLY_HOURS        = settings.MAX_YEARLY_HOURS       # ICAO yearly absolute limit
+WARN_YEARLY_HOURS       = MAX_YEARLY_HOURS * 0.89         # warn at ~89% of yearly limit
+MIN_REST_DOMESTIC       = settings.MIN_REST_HOURS         # ICAO minimum rest hours — domestic
+MIN_REST_INTERNATIONAL  = settings.MIN_REST_HOURS + 2.0   # international rest = domestic + 2h
+REST_WARN_BUFFER        = 2.0                             # warn when rest is within 2h of minimum
 
 IRAQI_AIRPORTS = {"BGW", "NJF", "BSR", "EBL", "OSM", "ISU", "RUM", "TQD"}
 
@@ -201,8 +206,15 @@ class ComplianceEngine:
 
         try:
             docs = self.sb.table("documents").select("*").eq("crew_id", crew_id).execute().data or []
-        except Exception:
-            return issues
+        except Exception as e:
+            _log.exception("documents lookup failed for crew_id=%s", crew_id)
+            return [ComplianceIssue(
+                rule="check_documents_unavailable",
+                severity=Severity.CRITICAL,
+                message_ar="تعذّر التحقق من الوثائق — راجع المسؤول قبل التكليف",
+                message_en="Could not verify documents — review before assignment",
+                detail={"error": str(e)[:200]},
+            )]
 
         for doc in docs:
             expiry_str = doc.get("expiry_date")
@@ -243,9 +255,16 @@ class ComplianceEngine:
         today = date.today()
 
         try:
-            records = self.sb.table("training").select("*").eq("crew_id", crew_id).execute().data or []
-        except Exception:
-            return issues
+            records = self.sb.table("training_records").select("*").eq("crew_id", crew_id).execute().data or []
+        except Exception as e:
+            _log.exception("training lookup failed for crew_id=%s", crew_id)
+            return [ComplianceIssue(
+                rule="check_training_unavailable",
+                severity=Severity.CRITICAL,
+                message_ar="تعذّر التحقق من سجلات التدريب — راجع المسؤول قبل التكليف",
+                message_en="Could not verify training records — review before assignment",
+                detail={"error": str(e)[:200]},
+            )]
 
         for rec in records:
             expiry_str = rec.get("expiry_date")
@@ -299,8 +318,15 @@ class ComplianceEngine:
                 .select("departure_time,duration_hours,status") \
                 .in_("id", flight_ids) \
                 .execute().data or []
-        except Exception:
-            return issues
+        except Exception as e:
+            _log.exception("flight-hours lookup failed for crew_id=%s", crew_id)
+            return [ComplianceIssue(
+                rule="check_flight_hours_unavailable",
+                severity=Severity.CRITICAL,
+                message_ar="تعذّر التحقق من ساعات الطيران (FTL) — راجع المسؤول",
+                message_en="Could not verify flight-time limits (FTL) — review before assignment",
+                detail={"error": str(e)[:200]},
+            )]
 
         monthly_h = 0.0
         h28d      = 0.0

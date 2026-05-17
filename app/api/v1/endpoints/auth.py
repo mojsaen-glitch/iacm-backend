@@ -1,20 +1,23 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Request
 from datetime import datetime, timezone
 from typing import List
 from app.api.deps import SbClient, CurrentUser, AdminOnly
 from app.schemas.auth import (
     LoginRequest, TokenResponse, RefreshTokenRequest,
     CurrentUserResponse, CreateUserRequest, UserListItem,
+    ChangePasswordRequest,
 )
 from app.core.security import verify_password, get_password_hash, create_access_token, create_refresh_token, decode_token
 from app.core.exceptions import UnauthorizedError, ForbiddenError
 from app.core.config import settings
+from app.core.rate_limit import limiter
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 
 @router.post("/login", response_model=TokenResponse)
-async def login(data: LoginRequest, sb: SbClient):
+@limiter.limit("5/minute")
+async def login(request: Request, data: LoginRequest, sb: SbClient):
     result = sb.table("users").select("*").eq("email", data.email).eq("is_active", True).execute()
     users = result.data
     if not users:
@@ -39,7 +42,8 @@ async def login(data: LoginRequest, sb: SbClient):
 
 
 @router.post("/refresh", response_model=TokenResponse)
-async def refresh_token(data: RefreshTokenRequest, sb: SbClient):
+@limiter.limit("5/minute")
+async def refresh_token(request: Request, data: RefreshTokenRequest, sb: SbClient):
     payload = decode_token(data.refresh_token)
     if not payload or payload.get("type") != "refresh":
         raise UnauthorizedError("Invalid or expired refresh token")
@@ -67,31 +71,22 @@ async def logout(current_user: CurrentUser, sb: SbClient):
 
 
 @router.post("/change-password")
-async def change_password(payload: dict, current_user: CurrentUser, sb: SbClient):
+@limiter.limit("5/minute")
+async def change_password(request: Request, data: ChangePasswordRequest, current_user: CurrentUser, sb: SbClient):
     """Allow authenticated user to change their own password."""
-    old_password = payload.get("old_password", "")
-    new_password = payload.get("new_password", "")
-
-    if not old_password or not new_password:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=422, detail="old_password and new_password are required")
-
-    if len(new_password) < 6:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=422, detail="كلمة المرور يجب أن تكون 6 أحرف على الأقل")
+    if len(data.new_password) < 8:
+        raise HTTPException(status_code=422, detail="كلمة المرور يجب أن تكون 8 أحرف على الأقل")
 
     # Re-fetch user with hashed_password
     result = sb.table("users").select("hashed_password").eq("id", current_user["id"]).execute()
     if not result.data:
-        from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="User not found")
 
-    if not verify_password(old_password, result.data[0]["hashed_password"]):
-        from fastapi import HTTPException
+    if not verify_password(data.old_password, result.data[0]["hashed_password"]):
         raise HTTPException(status_code=400, detail="كلمة المرور الحالية غير صحيحة")
 
     sb.table("users").update({
-        "hashed_password": get_password_hash(new_password),
+        "hashed_password": get_password_hash(data.new_password),
     }).eq("id", current_user["id"]).execute()
 
     return {"message": "Password changed successfully"}
@@ -139,7 +134,6 @@ async def create_user(data: CreateUserRequest, current_user: CurrentUser, sb: Sb
     # Check email uniqueness
     existing = sb.table("users").select("id").eq("email", data.email).execute()
     if existing.data:
-        from fastapi import HTTPException
         raise HTTPException(status_code=409, detail="البريد الإلكتروني مستخدم بالفعل")
 
     company_id = data.company_id or current_user["company_id"]
@@ -189,13 +183,11 @@ async def toggle_user_active(user_id: str, current_user: CurrentUser, sb: SbClie
 
     # Cannot deactivate self
     if user_id == current_user["id"]:
-        from fastapi import HTTPException
         raise HTTPException(status_code=400, detail="لا يمكنك تعطيل حسابك الخاص")
 
     result = sb.table("users").select("*").eq("id", user_id) \
         .eq("company_id", current_user["company_id"]).execute()
     if not result.data:
-        from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="المستخدم غير موجود")
 
     user = result.data[0]
@@ -208,3 +200,60 @@ async def toggle_user_active(user_id: str, current_user: CurrentUser, sb: SbClie
         role=u["role"], is_active=u["is_active"], company_id=u["company_id"],
         last_login=u.get("last_login"),
     )
+
+
+@router.post("/users/{user_id}/reset-password")
+@limiter.limit("3/minute")
+async def reset_user_password(request: Request, user_id: str, data: dict, current_user: CurrentUser, sb: SbClient):
+    """Admin resets another user's password. The temp password is shown ONCE in the
+    response so the admin can communicate it through a secure channel (do NOT log it).
+    Refresh tokens are invalidated to force re-login."""
+    if current_user["role"] not in ("super_admin", "admin"):
+        raise ForbiddenError("Admin access required")
+
+    # Admin cannot reset their own password through this endpoint (use /change-password)
+    if user_id == current_user["id"]:
+        raise HTTPException(status_code=400, detail="استخدم تغيير كلمة المرور لحسابك الخاص")
+
+    result = sb.table("users").select("id,email,name_ar,name_en").eq("id", user_id)\
+        .eq("company_id", current_user["company_id"]).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="المستخدم غير موجود")
+
+    new_password = (data.get("new_password") or "").strip()
+    if not new_password:
+        import secrets, string
+        alphabet     = string.ascii_letters + string.digits + "!@#$%"
+        new_password = "".join(secrets.choice(alphabet) for _ in range(16))
+
+    if len(new_password) < 8:
+        raise HTTPException(status_code=422, detail="كلمة المرور يجب أن تكون 8 أحرف على الأقل")
+
+    sb.table("users").update({
+        "hashed_password": get_password_hash(new_password),
+        "refresh_token":   None,
+    }).eq("id", user_id).execute()
+
+    # Audit trail — never log the password itself
+    try:
+        admin_name = current_user.get("name_ar") or current_user.get("name_en") or current_user["email"]
+        sb.table("audit_log").insert({
+            "user_id":     current_user["id"],
+            "user_name":   admin_name,
+            "action":      "reset_password",
+            "entity_type": "user",
+            "entity_id":   user_id,
+            "ip_address":  request.client.host if request.client else None,
+            "company_id":  current_user["company_id"],
+            "created_at":  datetime.now(timezone.utc).isoformat(),
+        }).execute()
+    except Exception:
+        # Audit failure must not break the operation, but it should be visible in server logs
+        import logging
+        logging.getLogger(__name__).exception("Failed to write audit log for password reset")
+
+    return {
+        "message":       "تم إعادة تعيين كلمة المرور — أبلغ المستخدم عبر قناة آمنة",
+        "temp_password": new_password,
+        "email":         result.data[0]["email"],
+    }

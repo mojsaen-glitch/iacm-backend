@@ -1,6 +1,10 @@
-from datetime import datetime, timezone  # used in send_message
-from fastapi import APIRouter, Query
+import logging
+from datetime import datetime, timezone
+from fastapi import APIRouter, Query, HTTPException
 from app.api.deps import SbClient, CurrentUser
+from app.websockets.manager import ws_manager
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/messages", tags=["Messages"])
 
@@ -133,7 +137,6 @@ async def send_message(
     content = payload.get("content", "").strip()
 
     if not receiver_id or not content:
-        from fastapi import HTTPException
         raise HTTPException(status_code=422, detail="receiver_id and content are required")
 
     now = datetime.now(timezone.utc).isoformat()
@@ -145,7 +148,16 @@ async def send_message(
         "created_at": now,
     }).execute()
 
-    return result.data[0] if result.data else {}
+    msg = result.data[0] if result.data else {}
+
+    # Broadcast to receiver if they are connected via WebSocket
+    if msg:
+        try:
+            await ws_manager.send_to_user(receiver_id, "new_message", msg)
+        except Exception as e:
+            logger.warning("WebSocket broadcast to user %s failed: %s", receiver_id, e)
+
+    return msg
 
 
 # ── Mark conversation as read ─────────────────────────────────────────────────

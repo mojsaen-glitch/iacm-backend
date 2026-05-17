@@ -1,0 +1,44 @@
+# Local-only artifacts that must NEVER ship to the serverless deployment.
+.env
+.env.local
+.env.example
+venv/
+.venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local SQLite scratch DB used by sqflite_common_ffi (Flutter desktop dev only)
+.dart_tool/
+
+# Local upload directory — Vercel serverless filesystem is ephemeral,
+# uploads are stored in Supabase Storage anyway.
+uploads/
+
+# Git internals
+.git/
+
+# Editor / OS junk
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+
+# One-off scripts that should never run as a serverless function
+clear_data.py
+setup_admin.py
+seed_supabase.py
+enable_rls.sql
+create_tables.sql
+reset_schema.sql
+tests/
+
+# Local Dockerfile + railway config — Vercel builds Python natively, doesn't need these
+Dockerfile
+docker-compose.yml
+railway.json

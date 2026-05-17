@@ -93,8 +93,8 @@ async def check_assignment_compliance(
     if not crew_id or not flight_id:
         return {"error": "crew_id and flight_id are required"}
 
-    # Load flight details
-    flight_res = sb.table("flights").select("*").eq("id", flight_id).execute()
+    # Load flight details — enforce company isolation
+    flight_res = sb.table("flights").select("*").eq("id", flight_id).eq("company_id", current_user["company_id"]).execute()
     if not flight_res.data:
         return {"error": f"Flight {flight_id} not found"}
     flight = flight_res.data[0]
