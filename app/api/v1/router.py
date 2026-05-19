@@ -17,6 +17,8 @@ from app.api.v1.endpoints import (
     maintenance,
     aircraft,
     safety,
+    irops,
+    bidding,
 )
 
 api_router = APIRouter()
@@ -38,3 +40,5 @@ api_router.include_router(payroll.router)
 api_router.include_router(maintenance.router)
 api_router.include_router(aircraft.router)
 api_router.include_router(safety.router)
+api_router.include_router(irops.router)
+api_router.include_router(bidding.router)
