@@ -14,6 +14,7 @@ from app.api.v1.endpoints import (
     leave_requests,
     om,
     payroll,
+    maintenance,
 )
 
 api_router = APIRouter()
@@ -32,3 +33,4 @@ api_router.include_router(training.router)
 api_router.include_router(leave_requests.router)
 api_router.include_router(om.router)
 api_router.include_router(payroll.router)
+api_router.include_router(maintenance.router)
