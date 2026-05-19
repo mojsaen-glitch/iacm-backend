@@ -19,7 +19,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, Dict, Tuple, Any
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
@@ -32,7 +32,9 @@ log = logging.getLogger(__name__)
 
 # ── In-memory cache so we don't burn the CheckWX free-tier quota ────
 # Keyed on ICAO; entries expire after CACHE_TTL_SECONDS.
-_WEATHER_CACHE: dict[str, tuple[float, dict]] = {}
+# Using typing.Dict/Tuple for compatibility with any Python the deploy
+# target lands on, even if we get downgraded to 3.8.
+_WEATHER_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 CACHE_TTL_SECONDS = 600  # 10 minutes — fresh enough for ops, cheap enough for the quota
 
 
@@ -43,7 +45,7 @@ CACHE_TTL_SECONDS = 600  # 10 minutes — fresh enough for ops, cheap enough for
 # legacy UI uses) and translate to ICAO for the AviationWeather call.
 # Extend this table as routes are added.
 # ──────────────────────────────────────────────────────────────────────
-_IATA_TO_ICAO: dict[str, str] = {
+_IATA_TO_ICAO: Dict[str, str] = {
     # Iraq
     "BGW": "ORBI",  # Baghdad (Saddam International / now Baghdad International)
     "BSR": "ORMM",  # Basra
@@ -82,7 +84,7 @@ _IATA_TO_ICAO: dict[str, str] = {
 _ICAO_TO_IATA = {v: k for k, v in _IATA_TO_ICAO.items()}
 
 
-def _resolve_codes(input_code: str) -> tuple[str, str]:
+def _resolve_codes(input_code: str) -> Tuple[str, str]:
     """Return (iata, icao) regardless of which the caller passed in."""
     c = (input_code or "").strip().upper()
     if c in _IATA_TO_ICAO:
@@ -305,7 +307,7 @@ def _ops_impact(wmo: int, vis_m: Optional[float], wind_kmh: Optional[float],
       • Wind > 55 km/h sustained OR gusts > 75 km/h → high
       • Thunderstorms → high
     """
-    factors: list[str] = []
+    factors = []  # list[str]
     risk = "low"
 
     # Visibility
@@ -360,8 +362,11 @@ def _ops_impact(wmo: int, vis_m: Optional[float], wind_kmh: Optional[float],
 
 
 @router.get("/weather")
-async def weather(station: str = Query(..., description="IATA or ICAO code"),
-                    current_user: CurrentUser = None, sb: SbClient = None):
+async def weather(
+    current_user: CurrentUser,
+    sb: SbClient,
+    station: str = Query(..., description="IATA or ICAO code"),
+):
     """Live METAR for the station + parsed ops impact + raw TAF.
 
     Returns same shape the existing UI expects, with these extras:
@@ -453,7 +458,7 @@ async def delay_risk(flight_id: str, current_user: CurrentUser, sb: SbClient):
     flight = f.data[0]
 
     score = 0
-    factors: list[dict] = []
+    factors = []  # list[dict]
 
     # 1. Weather at origin (max +35)
     origin = (flight.get("origin_code") or "").upper()
@@ -577,7 +582,7 @@ async def fatigue_risk(crew_id: str, current_user: CurrentUser, sb: SbClient):
     crew = c.data[0]
 
     score = 0
-    factors: list[dict] = []
+    factors = []  # list[dict]
 
     # 1. 28-day hours vs 100h cap
     h28 = float(crew.get("last_28day_hours") or crew.get("monthly_flight_hours") or 0)

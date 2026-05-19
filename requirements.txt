@@ -31,9 +31,9 @@ python-dateutil==2.9.0
 pytz==2024.2
 babel==2.16.0
 
-# Outbound HTTP (Sprint 6 — Open-Meteo weather lookups). FastAPI already
-# pulls httpx transitively but pin it so the version doesn't drift.
-httpx==0.28.1
+# Outbound HTTP — supabase 2.10 pins httpx<0.28, so we don't add our own
+# pin; the supabase transitive dep covers the import. If you upgrade
+# supabase past 2.13, re-evaluate whether to pin httpx explicitly.
 
 # Push Notifications (FCM) — optional at runtime.
 # When FIREBASE_SERVICE_ACCOUNT_JSON env var is unset, push_service falls
