@@ -1,18 +1,17 @@
-"""Intelligence & external integrations — Weather + AI-lite predictions.
+"""Intelligence & external integrations — METAR/TAF + AI-lite predictions.
 
-The "AI" here is intentionally **rule-based**, not ML. With a fleet this
-size you don't have enough training data to outperform good heuristics,
-and a rule engine is auditable in a way a model isn't. We surface the
-factors that drive the score so the dispatcher can override it if their
-gut says different.
+Weather now comes from **AviationWeather.gov** (US NOAA) — the same
+METAR/TAF feed Boeing/Airbus/Jeppesen consume. No API key, no rate
+limit, ICAO-coded, accurate to actual airport observations.
 
 Three readers:
-  • /intelligence/weather?station=XXX        — current conditions
+  • /intelligence/weather?station=XXX        — current METAR/TAF + ops impact
   • /intelligence/flight/{id}/delay-risk      — heuristic delay score
   • /intelligence/crew/{id}/fatigue-risk      — heuristic fatigue score
 """
 
 import logging
+import re
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -26,89 +25,159 @@ log = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Station coordinates — needed by the weather API.
-# Hard-coded for the Iraqi Airways network; extend as routes change.
+# IATA → ICAO mapping for the Iraqi Airways network.
+#
+# We keep accepting IATA codes from the frontend (which is what every
+# legacy UI uses) and translate to ICAO for the AviationWeather call.
+# Extend this table as routes are added.
 # ──────────────────────────────────────────────────────────────────────
-_STATION_COORDS: dict[str, tuple[float, float]] = {
-    "BGW": (33.2625, 44.2346),   # Baghdad
-    "BSR": (30.5491, 47.6621),   # Basra
-    "EBL": (36.2376, 43.9632),   # Erbil
-    "NJF": (31.9890, 44.4042),   # Najaf
-    "ISU": (35.5617, 45.3147),   # Sulaymaniyah
-    "DXB": (25.2532, 55.3657),   # Dubai
-    "AUH": (24.4330, 54.6511),
-    "DOH": (25.2731, 51.6080),
-    "KWI": (29.2267, 47.9689),
-    "BAH": (26.2708, 50.6336),
-    "MCT": (23.5933, 58.2844),
-    "RUH": (24.9576, 46.6988),
-    "JED": (21.6796, 39.1565),
-    "AMM": (31.7226, 35.9936),
-    "BEY": (33.8209, 35.4884),
-    "DAM": (33.4114, 36.5156),
-    "CAI": (30.1219, 31.4056),
-    "IST": (41.2753, 28.7519),
-    "IKA": (35.4161, 51.1522),
-    "DEL": (28.5562, 77.1000),
-    "FRA": (50.0379,  8.5622),
-    "LHR": (51.4770, -0.4613),
+_IATA_TO_ICAO: dict[str, str] = {
+    # Iraq
+    "BGW": "ORBI",  # Baghdad (Saddam International / now Baghdad International)
+    "BSR": "ORMM",  # Basra
+    "EBL": "ORER",  # Erbil
+    "NJF": "ORNI",  # Najaf
+    "ISU": "ORSU",  # Sulaymaniyah
+    # Gulf
+    "DXB": "OMDB",  # Dubai
+    "AUH": "OMAA",  # Abu Dhabi
+    "SHJ": "OMSJ",  # Sharjah
+    "DOH": "OTHH",  # Doha (Hamad)
+    "KWI": "OKBK",  # Kuwait
+    "BAH": "OBBI",  # Bahrain
+    "MCT": "OOMS",  # Muscat
+    "RUH": "OERK",  # Riyadh (King Khalid)
+    "JED": "OEJN",  # Jeddah
+    # Middle East
+    "AMM": "OJAI",  # Amman (Queen Alia)
+    "BEY": "OLBA",  # Beirut
+    "DAM": "OSDI",  # Damascus
+    "CAI": "HECA",  # Cairo
+    # Turkey / Asia
+    "IST": "LTFM",  # Istanbul (new airport)
+    "SAW": "LTFJ",  # Sabiha Gokcen
+    "IKA": "OIIE",  # Tehran Imam Khomeini
+    "MHD": "OIMM",  # Mashhad
+    "DEL": "VIDP",  # Delhi
+    # Europe
+    "FRA": "EDDF",  # Frankfurt
+    "LHR": "EGLL",  # London Heathrow
+    "VIE": "LOWW",  # Vienna
+    "ARN": "ESSA",  # Stockholm Arlanda
 }
 
+# Reverse lookup so the response can echo whichever the caller sent.
+_ICAO_TO_IATA = {v: k for k, v in _IATA_TO_ICAO.items()}
 
-@router.get("/weather")
-async def weather(station: str = Query(..., description="IATA code, e.g. BGW"),
-                    current_user: CurrentUser = None, sb: SbClient = None):
-    """Current weather for a station via Open-Meteo (free, no key).
 
-    Returns: temperature, wind speed + direction, visibility-relevant
-    weather code, and an `ops_impact` summary the UI can colour.
-    """
-    code = (station or "").strip().upper()
-    coords = _STATION_COORDS.get(code)
-    if not coords:
-        raise HTTPException(status_code=404,
-            detail=f"Station '{code}' not in weather lookup table")
+def _resolve_codes(input_code: str) -> tuple[str, str]:
+    """Return (iata, icao) regardless of which the caller passed in."""
+    c = (input_code or "").strip().upper()
+    if c in _IATA_TO_ICAO:
+        return c, _IATA_TO_ICAO[c]
+    if c in _ICAO_TO_IATA:
+        return _ICAO_TO_IATA[c], c
+    # Unknown — return as-is and let AviationWeather decide
+    return c, c
 
-    lat, lon = coords
-    url = (f"https://api.open-meteo.com/v1/forecast"
-           f"?latitude={lat}&longitude={lon}"
-           f"&current=temperature_2m,wind_speed_10m,wind_direction_10m,"
-           f"weather_code,visibility,relative_humidity_2m"
-           f"&timezone=UTC")
+
+# ──────────────────────────────────────────────────────────────────────
+# METAR fetching + parsing
+# ──────────────────────────────────────────────────────────────────────
+
+async def _fetch_metar(icao: str) -> Optional[dict]:
+    """Pull the latest METAR for the given ICAO code. Returns None if
+    AviationWeather can't supply one (private airfield, code wrong, etc.)."""
+    url = ("https://aviationweather.gov/api/data/metar"
+           f"?ids={icao}&format=json&hours=2")
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
+        async with httpx.AsyncClient(
+            timeout=8.0,
+            headers={"User-Agent": "IACM-FlightOps/1.0"},
+        ) as client:
             resp = await client.get(url)
             resp.raise_for_status()
             data = resp.json()
     except Exception as e:
-        log.warning("Open-Meteo lookup failed for %s: %s", code, e)
-        raise HTTPException(status_code=502,
-            detail="Weather service unavailable. Try again in a minute.")
+        log.warning("METAR fetch failed for %s: %s", icao, e)
+        return None
+    if not data or not isinstance(data, list):
+        return None
+    return data[0]  # most recent observation first
 
-    cur = data.get("current", {})
-    wmo = cur.get("weather_code", 0)
-    vis_m = cur.get("visibility", 99999)
-    wind_kmh = cur.get("wind_speed_10m", 0) or 0
-    impact = _ops_impact(wmo, vis_m, wind_kmh)
 
-    return {
-        "station":          code,
-        "lat":              lat,
-        "lon":              lon,
-        "temperature_c":    cur.get("temperature_2m"),
-        "wind_speed_kmh":   wind_kmh,
-        "wind_direction":   cur.get("wind_direction_10m"),
-        "humidity_pct":     cur.get("relative_humidity_2m"),
-        "visibility_m":     vis_m,
-        "weather_code":     wmo,
-        "condition":        _wmo_label(wmo),
-        "ops_impact":       impact,
-        "fetched_at":       datetime.now(timezone.utc).isoformat(),
-    }
+async def _fetch_taf(icao: str) -> Optional[str]:
+    """Pull the latest raw TAF — kept as a string for display. We don't
+    parse the forecast windows here; the dispatcher reads it raw."""
+    url = (f"https://aviationweather.gov/api/data/taf"
+           f"?ids={icao}&format=json")
+    try:
+        async with httpx.AsyncClient(
+            timeout=8.0,
+            headers={"User-Agent": "IACM-FlightOps/1.0"},
+        ) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception:
+        return None
+    if not data or not isinstance(data, list):
+        return None
+    return data[0].get("rawTAF")
+
+
+def _parse_visibility(visib) -> Optional[float]:
+    """METAR visibility comes back as either a number (metres or statute
+    miles) or a string like '10+', '6SM', '9999'. Return metres."""
+    if visib is None: return None
+    if isinstance(visib, (int, float)):
+        # Heuristic: AviationWeather uses metres for non-US stations,
+        # statute miles for US. Anything > 50 has to be metres because
+        # 50 SM = 80 km — outside any METAR meaningfully reports.
+        return float(visib) * (1609.34 if visib < 50 else 1.0)
+    s = str(visib).strip().replace("+", "")
+    # SM (statute miles)
+    if "SM" in s.upper():
+        try:
+            n = float(s.upper().replace("SM", "").strip())
+            return n * 1609.34
+        except ValueError:
+            return None
+    # Plain number (assume metres for non-US)
+    try:
+        n = float(s)
+        return n * (1609.34 if n < 50 else 1.0)
+    except ValueError:
+        return None
+
+
+def _weather_code_from_wx(wx_string: Optional[str], clouds: list) -> int:
+    """Approximate WMO weather code from METAR wxString + clouds.
+    Mirrors Open-Meteo's coding so the frontend icon picker keeps working."""
+    wx = (wx_string or "").upper()
+    if "TS" in wx: return 95
+    if "FZ" in wx and ("RA" in wx or "DZ" in wx): return 65
+    if "SN" in wx: return 75
+    if "RA" in wx or "SHRA" in wx: return 65
+    if "DZ" in wx: return 53
+    if "FG" in wx: return 45
+    if "BR" in wx: return 48  # mist
+    if "HZ" in wx: return 48  # haze
+    # Fall back to cloud cover
+    if clouds:
+        max_cover = max((_cloud_octas(c.get("cover", "")) for c in clouds), default=0)
+        if max_cover >= 8: return 3
+        if max_cover >= 5: return 2
+        if max_cover >= 3: return 1
+    return 0  # clear
+
+
+def _cloud_octas(cover: str) -> int:
+    return {"SKC": 0, "CLR": 0, "NCD": 0, "FEW": 2, "SCT": 4,
+            "BKN": 6, "OVC": 8, "VV":  8}.get(cover.upper(), 0)
 
 
 def _wmo_label(code: int) -> str:
-    """Open-Meteo WMO code → short Arabic label."""
     if code == 0: return "صافي"
     if code in (1, 2, 3): return "غائم جزئياً"
     if code in (45, 48): return "ضباب"
@@ -119,25 +188,63 @@ def _wmo_label(code: int) -> str:
     return f"WMO {code}"
 
 
-def _ops_impact(wmo: int, vis_m: float, wind_kmh: float) -> dict:
-    """Heuristic — does this weather impede flight ops?"""
-    factors = []
+def _cloud_ceiling_ft(clouds: list) -> Optional[int]:
+    """Lowest BKN/OVC layer base — the official 'ceiling' in aviation."""
+    if not clouds: return None
+    bases = [c.get("base") for c in clouds
+             if c.get("cover", "").upper() in {"BKN", "OVC", "VV"}
+             and isinstance(c.get("base"), (int, float))]
+    return int(min(bases)) if bases else None
+
+
+def _ops_impact(wmo: int, vis_m: Optional[float], wind_kmh: Optional[float],
+                gust_kmh: Optional[float], ceiling_ft: Optional[int]) -> dict:
+    """Aviation-grade impact heuristic.
+
+    Thresholds:
+      • CAT-I minima: ceiling ≥ 200 ft, visibility ≥ 800 m
+      • Lower than CAT-I → flag as high
+      • Wind > 55 km/h sustained OR gusts > 75 km/h → high
+      • Thunderstorms → high
+    """
+    factors: list[str] = []
     risk = "low"
 
-    if vis_m is not None and vis_m < 1500:
-        factors.append(f"رؤية {int(vis_m)}م < CAT-I")
-        risk = "high"
-    elif vis_m is not None and vis_m < 3000:
-        factors.append(f"رؤية محدودة {int(vis_m)}م")
-        if risk != "high": risk = "medium"
+    # Visibility
+    if vis_m is not None:
+        if vis_m < 1500:
+            factors.append(f"رؤية {int(vis_m)}م — تحت CAT-I")
+            risk = "high"
+        elif vis_m < 3000:
+            factors.append(f"رؤية محدودة {int(vis_m)}م")
+            if risk != "high": risk = "medium"
 
+    # Cloud ceiling
+    if ceiling_ft is not None:
+        if ceiling_ft < 200:
+            factors.append(f"سقف غيوم {ceiling_ft} قدم — تحت CAT-I")
+            risk = "high"
+        elif ceiling_ft < 500:
+            factors.append(f"سقف غيوم منخفض {ceiling_ft} قدم")
+            if risk != "high": risk = "medium"
+
+    # Wind (sustained)
     if wind_kmh and wind_kmh >= 55:
-        factors.append(f"رياح {int(wind_kmh)} كم/س")
+        factors.append(f"رياح ثابتة {int(wind_kmh)} كم/س")
         risk = "high"
     elif wind_kmh and wind_kmh >= 35:
         factors.append(f"رياح {int(wind_kmh)} كم/س")
         if risk != "high": risk = "medium"
 
+    # Gusts (often the real ops constraint)
+    if gust_kmh and gust_kmh >= 75:
+        factors.append(f"هبّات {int(gust_kmh)} كم/س")
+        risk = "high"
+    elif gust_kmh and gust_kmh >= 55:
+        factors.append(f"هبّات {int(gust_kmh)} كم/س")
+        if risk != "high": risk = "medium"
+
+    # Weather phenomena
     if wmo in (95, 96, 99):
         factors.append("عواصف رعدية")
         risk = "high"
@@ -145,13 +252,85 @@ def _ops_impact(wmo: int, vis_m: float, wind_kmh: float) -> dict:
         factors.append("هطول ثلوج")
         if risk != "high": risk = "medium"
     elif wmo in (45, 48):
-        factors.append("ضباب")
+        factors.append("ضباب/شبورة")
         if risk == "low": risk = "medium"
 
     return {
-        "risk":   risk,                                      # low | medium | high
+        "risk":    risk,
         "factors": factors or ["ظروف طبيعية"],
     }
+
+
+@router.get("/weather")
+async def weather(station: str = Query(..., description="IATA or ICAO code"),
+                    current_user: CurrentUser = None, sb: SbClient = None):
+    """Live METAR for the station + parsed ops impact + raw TAF.
+
+    Returns same shape the existing UI expects, with these extras:
+      • icao            — the ICAO code used for lookup
+      • cloud_ceiling_ft — lowest BKN/OVC base
+      • altimeter_hpa   — QNH
+      • raw_metar       — original METAR text (always include for pilots)
+      • raw_taf         — original TAF forecast text
+      • gust_kmh        — peak gust if reported
+    """
+    iata, icao = _resolve_codes(station)
+    if not icao or len(icao) != 4:
+        raise HTTPException(status_code=422,
+            detail=f"'{station}' is not a recognised IATA/ICAO code")
+
+    metar = await _fetch_metar(icao)
+    if not metar:
+        raise HTTPException(status_code=502,
+            detail=f"No METAR available for {icao}. Station may be offline.")
+
+    # ── Pull fields safely ─────────────────────────────────────────
+    temp = metar.get("temp")
+    wspd_kt = metar.get("wspd")            # knots
+    wgst_kt = metar.get("wgst")            # knots
+    wdir    = metar.get("wdir")
+    vis_m   = _parse_visibility(metar.get("visib"))
+    clouds  = metar.get("clouds") or []
+    wx_str  = metar.get("wxString")
+    altim   = metar.get("altim")           # already hPa for non-US
+    raw     = metar.get("rawOb")
+
+    wmo = _weather_code_from_wx(wx_str, clouds)
+    ceiling = _cloud_ceiling_ft(clouds)
+
+    wind_kmh = (wspd_kt * 1.852) if wspd_kt is not None else None
+    gust_kmh = (wgst_kt * 1.852) if wgst_kt is not None else None
+
+    impact = _ops_impact(wmo, vis_m, wind_kmh, gust_kmh, ceiling)
+
+    # TAF (best-effort — don't fail the whole call if missing)
+    taf = await _fetch_taf(icao)
+
+    return {
+        "station":          iata or icao,   # echo what the UI expects
+        "icao":             icao,
+        "lat":              metar.get("lat"),
+        "lon":              metar.get("lon"),
+        "temperature_c":    temp,
+        "dew_point_c":      metar.get("dewp"),
+        "wind_speed_kmh":   round(wind_kmh, 1) if wind_kmh is not None else None,
+        "wind_direction":   wdir,
+        "wind_gust_kmh":    round(gust_kmh, 1) if gust_kmh is not None else None,
+        "visibility_m":     int(vis_m) if vis_m is not None else None,
+        "cloud_ceiling_ft": ceiling,
+        "altimeter_hpa":    round(altim, 1) if altim else None,
+        "weather_code":     wmo,
+        "condition":        _wmo_label(wmo),
+        "raw_metar":        raw,
+        "raw_taf":          taf,
+        "ops_impact":       impact,
+        "fetched_at":       datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# Legacy export — used by other modules that just need the coordinate set.
+# Kept as IATA-keyed so existing call sites don't need refactoring.
+_STATION_COORDS = {k: (None, None) for k in _IATA_TO_ICAO.keys()}
 
 
 # ──────────────────────────────────────────────────────────────────────
