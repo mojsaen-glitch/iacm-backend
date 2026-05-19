@@ -3,9 +3,10 @@ import logging
 import uuid, math
 from typing import Optional
 from datetime import datetime, timezone
-from fastapi import APIRouter, Query, HTTPException
+from fastapi import APIRouter, Query, HTTPException, Request
 from app.api.deps import SbClient, CurrentUser
 from app.core.exceptions import NotFoundError, ForbiddenError
+from app.core.rate_limit import limiter
 from app.services import push_service
 
 router = APIRouter(prefix="/flights", tags=["Flights"])
@@ -48,7 +49,8 @@ async def list_flights(
 
 
 @router.post("", status_code=201)
-async def create_flight(data: dict, current_user: CurrentUser, sb: SbClient):
+@limiter.limit("30/minute")
+async def create_flight(request: Request, data: dict, current_user: CurrentUser, sb: SbClient):
     _ensure_flight_editor(current_user)
     try:
         dep = datetime.fromisoformat(data["departure_time"].replace("Z", "+00:00"))
@@ -191,6 +193,9 @@ async def publish_flight(flight_id: str, current_user: CurrentUser, sb: SbClient
     - Changes publish_status to 'published'
     - Sends in-app notification to all allocators in the same company
     """
+    # Publishing puts a flight into the assignable pool and fans out
+    # notifications to every allocator — strictly an editor action.
+    _ensure_flight_editor(current_user)
     flight_res = sb.table("flights").select("*") \
         .eq("id", flight_id).eq("company_id", current_user["company_id"]).execute()
     if not flight_res.data:
