@@ -262,9 +262,25 @@ async def publish_flight(flight_id: str, current_user: CurrentUser, sb: SbClient
 
 VALID_STATUSES = {"scheduled", "boarding", "departed", "landed", "cancelled", "diverted", "delayed"}
 
+# Reason codes used by the cancellation / delay dialogs in the UI.
+# Keeping the list closed-set so we can build aggregate reports later
+# (e.g. "what % of cancellations were weather vs. technical?").
+CANCELLATION_REASONS = {
+    "weather", "technical", "crew_shortage", "operational",
+    "commercial", "atc", "security", "other",
+}
+
 @router.patch("/{flight_id}/status")
 async def update_flight_status(flight_id: str, data: dict, current_user: CurrentUser, sb: SbClient):
-    """Update operational status of a flight (flight movement tracking)."""
+    """Update operational status of a flight (flight movement tracking).
+
+    For status=cancelled or delayed the body may include:
+      - `reason`: closed-set reason code (see CANCELLATION_REASONS)
+      - `reason_notes`: free-text explanation
+      - `delay_minutes`: integer (for status=delayed)
+    These get stamped onto the flight row + an audit entry so we can
+    build IROPS reports later.
+    """
     if current_user["role"] not in ("super_admin", "admin", "ops_manager"):
         raise ForbiddenError("يتطلب صلاحية مدير العمليات")
 
@@ -280,9 +296,27 @@ async def update_flight_status(flight_id: str, data: dict, current_user: Current
     if not existing.data:
         raise NotFoundError("Flight", flight_id)
 
-    result = sb.table("flights").update({
+    update = {
         "status": new_status,
         "updated_at": datetime.now(timezone.utc).isoformat(),
-    }).eq("id", flight_id).execute()
+    }
+    # Capture reason on cancel/delay/divert so reports can break down by cause.
+    if new_status in {"cancelled", "delayed", "diverted"}:
+        reason = (data.get("reason") or "").strip().lower()
+        if reason:
+            if reason not in CANCELLATION_REASONS:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"reason must be one of: {', '.join(CANCELLATION_REASONS)}",
+                )
+            update["cancellation_reason"] = reason  # column reused for delay/divert too
+        if data.get("reason_notes"):
+            update["cancellation_notes"] = str(data["reason_notes"])[:500]
+        if new_status == "delayed" and data.get("delay_minutes") is not None:
+            try:
+                update["delay_minutes"] = int(data["delay_minutes"])
+            except (TypeError, ValueError):
+                pass
 
+    result = sb.table("flights").update(update).eq("id", flight_id).execute()
     return result.data[0] if result.data else {}

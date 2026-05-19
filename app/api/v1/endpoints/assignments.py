@@ -323,3 +323,119 @@ async def acknowledge_assignment(assignment_id: str, current_user: CurrentUser, 
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", assignment_id).execute()
     return result.data[0] if result.data else {}
+
+
+@router.post("/{assignment_id}/decline")
+async def decline_assignment(
+    assignment_id: str, data: dict, current_user: CurrentUser, sb: SbClient
+):
+    """Crew declines an assignment with a reason.
+
+    Marks the row as declined + notifies every scheduler/ops manager in the
+    company so the row can be reassigned quickly. The scheduler then chooses
+    a replacement; the declined row stays on the audit trail.
+    """
+    existing = sb.table("assignments").select("id,flight_id,crew_id").eq("id", assignment_id).execute()
+    if not existing.data:
+        raise NotFoundError("Assignment", assignment_id)
+
+    row = existing.data[0]
+    flight_id = row.get("flight_id")
+    reason = (data.get("reason") or "").strip()
+
+    # Verify scope + capture flight number for the notification body.
+    flight_number = "—"
+    if flight_id:
+        f = sb.table("flights").select("flight_number,company_id")\
+            .eq("id", flight_id).eq("company_id", current_user["company_id"]).execute()
+        if not f.data:
+            raise NotFoundError("Assignment", assignment_id)
+        flight_number = f.data[0].get("flight_number", "—")
+
+    # Crew can only decline their own row.
+    if current_user.get("role") == "crew" and current_user.get("crew_id") != row.get("crew_id"):
+        raise ForbiddenError("Cannot decline another crew member's assignment")
+
+    sb.table("assignments").update({
+        "acknowledged": False,
+        "declined": True,
+        "decline_reason": reason or None,
+        "declined_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", assignment_id).execute()
+
+    # Fan-out alert to schedulers + ops managers
+    targets = sb.table("users").select("id")\
+        .eq("company_id", current_user["company_id"])\
+        .in_("role", ["admin", "super_admin", "ops_manager", "scheduler"])\
+        .execute()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    crew_name = current_user.get("name_ar") or current_user.get("name_en") or "طاقم"
+    rows = [{
+        "id":             str(uuid.uuid4()),
+        "user_id":        u["id"],
+        "type":           "assignment_declined",
+        "title_ar":       "رفض تكليف",
+        "title_en":       "Assignment declined",
+        "message_ar":     f"{crew_name} رفض رحلة {flight_number}"
+                          + (f" — السبب: {reason}" if reason else ""),
+        "message_en":     f"{crew_name} declined flight {flight_number}"
+                          + (f" — reason: {reason}" if reason else ""),
+        "reference_id":   assignment_id,
+        "reference_type": "assignment",
+        "is_read":        False,
+        "created_at":     now_iso,
+    } for u in (targets.data or [])]
+    if rows:
+        sb.table("notifications").insert(rows).execute()
+
+    return {"declined": True, "notified": len(rows)}
+
+
+@router.post("/crew-self-report", status_code=201)
+async def file_crew_self_report(
+    data: dict, current_user: CurrentUser, sb: SbClient
+):
+    """Crew files a fatigue or sick report.
+
+    Body: { type: 'fatigue' | 'sick', notes?: str }
+
+    Logs as a notification routed to every scheduler/ops manager so they
+    can act (remove from upcoming pairings, schedule replacement). The
+    crew member is the only one who can file on their own behalf —
+    schedulers don't create these for someone else.
+    """
+    report_type = (data.get("type") or "").strip().lower()
+    if report_type not in {"fatigue", "sick"}:
+        raise HTTPException(status_code=422, detail="type must be 'fatigue' or 'sick'")
+    if current_user.get("role") != "crew":
+        raise ForbiddenError("Only crew can file fatigue or sick reports for themselves")
+
+    notes = (data.get("notes") or "").strip()
+    targets = sb.table("users").select("id")\
+        .eq("company_id", current_user["company_id"])\
+        .in_("role", ["admin", "super_admin", "ops_manager", "scheduler"])\
+        .execute()
+    crew_name = current_user.get("name_ar") or current_user.get("name_en") or "طاقم"
+    title_ar  = "تقرير إجهاد" if report_type == "fatigue" else "إعلان مرضي"
+    title_en  = "Fatigue report" if report_type == "fatigue" else "Sick report"
+    now_iso   = datetime.now(timezone.utc).isoformat()
+    body_ar   = f"{crew_name}" + (f" — {notes}" if notes else "")
+
+    rows = [{
+        "id":             str(uuid.uuid4()),
+        "user_id":        u["id"],
+        "type":           f"crew_{report_type}_report",
+        "title_ar":       title_ar,
+        "title_en":       title_en,
+        "message_ar":     body_ar,
+        "message_en":     body_ar,
+        "reference_id":   current_user.get("crew_id"),
+        "reference_type": "crew",
+        "is_read":        False,
+        "created_at":     now_iso,
+    } for u in (targets.data or [])]
+    if rows:
+        sb.table("notifications").insert(rows).execute()
+
+    return {"type": report_type, "notified": len(rows)}
