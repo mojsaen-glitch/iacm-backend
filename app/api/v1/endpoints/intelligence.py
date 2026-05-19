@@ -1,8 +1,13 @@
 """Intelligence & external integrations — METAR/TAF + AI-lite predictions.
 
-Weather now comes from **AviationWeather.gov** (US NOAA) — the same
-METAR/TAF feed Boeing/Airbus/Jeppesen consume. No API key, no rate
-limit, ICAO-coded, accurate to actual airport observations.
+Weather sources, tried in order:
+  1. **CheckWX** (paid-tier-like JSON, parsed wxString/clouds/flight_category)
+     Used as primary when CHECKWX_API_KEY env var is set.
+     Free tier ceiling: 300 calls/day per key — we cache aggressively
+     (10 min TTL per ICAO) so 22 stations × multiple dashboards still
+     stays inside the quota.
+  2. **AviationWeather.gov** (NOAA — keyless, unlimited) — fallback
+     when CheckWX is unset, errors, or returns 429.
 
 Three readers:
   • /intelligence/weather?station=XXX        — current METAR/TAF + ops impact
@@ -11,7 +16,8 @@ Three readers:
 """
 
 import logging
-import re
+import os
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -22,6 +28,12 @@ from app.api.deps import CurrentUser, SbClient
 
 router = APIRouter(prefix="/intelligence", tags=["Intelligence"])
 log = logging.getLogger(__name__)
+
+
+# ── In-memory cache so we don't burn the CheckWX free-tier quota ────
+# Keyed on ICAO; entries expire after CACHE_TTL_SECONDS.
+_WEATHER_CACHE: dict[str, tuple[float, dict]] = {}
+CACHE_TTL_SECONDS = 600  # 10 minutes — fresh enough for ops, cheap enough for the quota
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -85,9 +97,72 @@ def _resolve_codes(input_code: str) -> tuple[str, str]:
 # METAR fetching + parsing
 # ──────────────────────────────────────────────────────────────────────
 
-async def _fetch_metar(icao: str) -> Optional[dict]:
-    """Pull the latest METAR for the given ICAO code. Returns None if
-    AviationWeather can't supply one (private airfield, code wrong, etc.)."""
+async def _fetch_metar_checkwx(icao: str, api_key: str) -> Optional[dict]:
+    """CheckWX returns a richer parsed METAR. Field shape differs from
+    AviationWeather, so we normalise into the same dict so downstream
+    code doesn't care which source served us."""
+    url = f"https://api.checkwx.com/metar/{icao}/decoded"
+    try:
+        async with httpx.AsyncClient(
+            timeout=8.0,
+            headers={
+                "X-API-Key":  api_key,
+                "User-Agent": "IACM-FlightOps/1.0",
+            },
+        ) as client:
+            resp = await client.get(url)
+            if resp.status_code == 429:
+                log.warning("CheckWX quota exhausted for %s — falling back", icao)
+                return None
+            resp.raise_for_status()
+            payload = resp.json()
+    except Exception as e:
+        log.warning("CheckWX METAR fetch failed for %s: %s", icao, e)
+        return None
+
+    rows = payload.get("data") or []
+    if not rows:
+        return None
+    r = rows[0]
+
+    # Normalise CheckWX → AviationWeather-shape dict so the rest of the
+    # pipeline (parsing, ops_impact, response shape) doesn't change.
+    temp = (r.get("temperature") or {}).get("celsius")
+    dewp = (r.get("dewpoint")    or {}).get("celsius")
+    wind = r.get("wind") or {}
+    wspd_kt = wind.get("speed_kts")
+    wgst_kt = wind.get("gust_kts")
+    wdir    = wind.get("degrees")
+    vis     = (r.get("visibility") or {}).get("meters_float")
+    altim   = (r.get("barometer")  or {}).get("hpa")
+    clouds  = [{
+        "cover": (c.get("code") or "").upper(),
+        "base":  c.get("base_feet_agl") or c.get("feet"),
+    } for c in (r.get("clouds") or [])]
+    wx_str = " ".join(
+        (c.get("code") or "").upper()
+        for c in (r.get("conditions") or [])
+    ) or None
+
+    return {
+        "rawOb":    r.get("raw_text"),
+        "temp":     temp,
+        "dewp":     dewp,
+        "wspd":     wspd_kt,
+        "wgst":     wgst_kt,
+        "wdir":     wdir,
+        "visib":    vis,
+        "altim":    altim,
+        "clouds":   clouds,
+        "wxString": wx_str,
+        "lat":      (r.get("station") or {}).get("geometry", {}).get("coordinates", [None, None])[1],
+        "lon":      (r.get("station") or {}).get("geometry", {}).get("coordinates", [None, None])[0],
+        "_source":  "checkwx",
+    }
+
+
+async def _fetch_metar_avwx(icao: str) -> Optional[dict]:
+    """AviationWeather.gov fallback — keyless, unlimited."""
     url = ("https://aviationweather.gov/api/data/metar"
            f"?ids={icao}&format=json&hours=2")
     try:
@@ -99,11 +174,34 @@ async def _fetch_metar(icao: str) -> Optional[dict]:
             resp.raise_for_status()
             data = resp.json()
     except Exception as e:
-        log.warning("METAR fetch failed for %s: %s", icao, e)
+        log.warning("AviationWeather METAR fetch failed for %s: %s", icao, e)
         return None
     if not data or not isinstance(data, list):
         return None
-    return data[0]  # most recent observation first
+    result = data[0]
+    result["_source"] = "aviationweather"
+    return result
+
+
+async def _fetch_metar(icao: str) -> Optional[dict]:
+    """Source-aware fetch with cache. Tries CheckWX first if a key is
+    configured, falls back to AviationWeather, returns whichever wins."""
+    # Cache hit?
+    now = time.time()
+    cached = _WEATHER_CACHE.get(icao)
+    if cached and (now - cached[0]) < CACHE_TTL_SECONDS:
+        return cached[1]
+
+    api_key = os.getenv("CHECKWX_API_KEY", "").strip()
+    metar: Optional[dict] = None
+    if api_key:
+        metar = await _fetch_metar_checkwx(icao, api_key)
+    if metar is None:
+        metar = await _fetch_metar_avwx(icao)
+
+    if metar is not None:
+        _WEATHER_CACHE[icao] = (now, metar)
+    return metar
 
 
 async def _fetch_taf(icao: str) -> Optional[str]:
@@ -324,6 +422,7 @@ async def weather(station: str = Query(..., description="IATA or ICAO code"),
         "raw_metar":        raw,
         "raw_taf":          taf,
         "ops_impact":       impact,
+        "source":           metar.get("_source", "unknown"),
         "fetched_at":       datetime.now(timezone.utc).isoformat(),
     }
 
