@@ -175,6 +175,36 @@ async def create_user(data: CreateUserRequest, current_user: CurrentUser, sb: Sb
     )
 
 
+@router.patch("/users/{user_id}/role", response_model=UserListItem)
+async def update_user_role(user_id: str, data: dict, current_user: CurrentUser, sb: SbClient):
+    """Change a user's role. Admin only. Cannot demote yourself."""
+    if current_user["role"] not in ("super_admin", "admin"):
+        raise ForbiddenError("Admin access required")
+    if user_id == current_user["id"]:
+        raise HTTPException(status_code=400, detail="لا يمكنك تعديل دور حسابك الخاص")
+
+    new_role = (data.get("role") or "").strip()
+    if not new_role:
+        raise HTTPException(status_code=422, detail="role is required")
+
+    # Locking down super_admin promotion to existing super_admins only
+    if new_role == "super_admin" and current_user["role"] != "super_admin":
+        raise ForbiddenError("Only a super admin can grant super_admin")
+
+    existing = sb.table("users").select("*").eq("id", user_id) \
+        .eq("company_id", current_user["company_id"]).execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="المستخدم غير موجود")
+
+    updated = sb.table("users").update({"role": new_role}).eq("id", user_id).execute()
+    u = updated.data[0]
+    return UserListItem(
+        id=u["id"], email=u["email"], name_ar=u["name_ar"], name_en=u["name_en"],
+        role=u["role"], is_active=u["is_active"], company_id=u["company_id"],
+        last_login=u.get("last_login"),
+    )
+
+
 @router.patch("/users/{user_id}/toggle", response_model=UserListItem)
 async def toggle_user_active(user_id: str, current_user: CurrentUser, sb: SbClient):
     """Activate or deactivate a user. Admin only."""

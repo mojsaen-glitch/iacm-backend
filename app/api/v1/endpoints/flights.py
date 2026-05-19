@@ -10,6 +10,17 @@ from app.services import push_service
 
 router = APIRouter(prefix="/flights", tags=["Flights"])
 
+# Only operations staff create / modify flights. Movement dept needs to
+# create flights on their movement portal, so they're included.
+_FLIGHT_EDITORS = {
+    "super_admin", "admin", "ops_manager", "scheduler", "flight_movement",
+}
+
+
+def _ensure_flight_editor(user: dict) -> None:
+    if user.get("role") not in _FLIGHT_EDITORS:
+        raise ForbiddenError("Only ops / scheduling / movement can create or modify flights")
+
 
 @router.get("")
 async def list_flights(
@@ -38,6 +49,7 @@ async def list_flights(
 
 @router.post("", status_code=201)
 async def create_flight(data: dict, current_user: CurrentUser, sb: SbClient):
+    _ensure_flight_editor(current_user)
     try:
         dep = datetime.fromisoformat(data["departure_time"].replace("Z", "+00:00"))
         arr = datetime.fromisoformat(data["arrival_time"].replace("Z", "+00:00"))
@@ -83,6 +95,7 @@ async def get_flight(flight_id: str, current_user: CurrentUser, sb: SbClient):
 
 @router.patch("/{flight_id}")
 async def update_flight(flight_id: str, data: dict, current_user: CurrentUser, sb: SbClient):
+    _ensure_flight_editor(current_user)
     existing = sb.table("flights").select("id").eq("id", flight_id).eq("company_id", current_user["company_id"]).execute()
     if not existing.data:
         raise NotFoundError("Flight", flight_id)

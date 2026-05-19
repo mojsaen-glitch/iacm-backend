@@ -14,6 +14,33 @@ def _generate_temp_password() -> str:
 
 router = APIRouter(prefix="/crew", tags=["Crew Management"])
 
+# Role gates — kept here so anyone scanning this file sees the policy at a
+# glance. Update both `_READERS` and the AuthProvider helpers in lock-step.
+_READERS = {
+    "super_admin", "admin", "ops_manager", "scheduler",
+    "crew_allocator", "cabin_allocator", "cockpit_allocator", "ground_allocator",
+    "compliance_officer", "flight_movement", "flight_ops", "flight_operations",
+    # Specialty schedulers
+    "sched_captain", "sched_copilot", "sched_engineer", "sched_purser",
+    "sched_cabin", "sched_balance", "sched_security", "sched_extra",
+}
+_EDITORS = {"super_admin", "admin", "ops_manager", "scheduler"}
+
+
+def _ensure_reader(user: dict) -> None:
+    if user.get("role") not in _READERS:
+        raise ForbiddenError("Only operations staff can browse the crew roster")
+
+
+def _ensure_editor(user: dict) -> None:
+    if user.get("role") not in _EDITORS:
+        raise ForbiddenError("Only admin / ops manager / scheduler can edit crew records")
+
+
+def _is_own_record(user: dict, crew_id: str) -> bool:
+    """True when a logged-in crew member is reading/editing their own row."""
+    return user.get("role") == "crew" and user.get("crew_id") == crew_id
+
 
 @router.get("")
 async def list_crew(
@@ -25,6 +52,7 @@ async def list_crew(
     rank: Optional[str] = None,
     search: Optional[str] = None,
 ):
+    _ensure_reader(current_user)
     query = sb.table("crew").select("*", count="exact").eq("company_id", current_user["company_id"])
     if status:
         query = query.eq("status", status)
@@ -140,6 +168,10 @@ async def create_crew(data: dict, current_user: CurrentUser, sb: SbClient):
 
 @router.get("/{crew_id}")
 async def get_crew(crew_id: str, current_user: CurrentUser, sb: SbClient):
+    # Readers OR the crew member themself (so a pilot can open /crew-portal
+    # and load their own profile).
+    if not _is_own_record(current_user, crew_id):
+        _ensure_reader(current_user)
     result = sb.table("crew").select("*").eq("id", crew_id).eq("company_id", current_user["company_id"]).execute()
     if not result.data:
         raise NotFoundError("Crew member", crew_id)
@@ -148,6 +180,12 @@ async def get_crew(crew_id: str, current_user: CurrentUser, sb: SbClient):
 
 @router.patch("/{crew_id}")
 async def update_crew(crew_id: str, data: dict, current_user: CurrentUser, sb: SbClient):
+    # Editors are admin/ops/scheduler. We deliberately do NOT allow a crew
+    # member to PATCH their own row — fields like rank, salary, base, etc.
+    # are owned by Ops. Crew-driven self-service (e.g. avatar, phone) should
+    # go through a dedicated, field-whitelisted endpoint when we add it.
+    _ensure_editor(current_user)
+
     existing = sb.table("crew").select("id").eq("id", crew_id).eq("company_id", current_user["company_id"]).execute()
     if not existing.data:
         raise NotFoundError("Crew member", crew_id)
