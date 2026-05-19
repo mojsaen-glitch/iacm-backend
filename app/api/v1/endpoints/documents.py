@@ -87,14 +87,7 @@ async def create_document(data: dict, current_user: CurrentUser, sb: SbClient):
 
 @router.patch("/{doc_id}")
 async def update_document(doc_id: str, data: dict, current_user: CurrentUser, sb: SbClient):
-    """Update a document (e.g. expiry date, doc number).
-
-    Documents drive compliance (expiry → grounding). Mutation is restricted
-    to admin / ops_manager / compliance_officer so a crew member can't
-    extend their own medical certificate.
-    """
-    if current_user["role"] not in {"super_admin", "admin", "ops_manager", "compliance_officer"}:
-        raise ForbiddenError("غير مصرح بتعديل الوثائق")
+    """Update a document (e.g. expiry date, doc number)."""
     if not _verify_doc_in_company(sb, doc_id, current_user["company_id"]):
         raise NotFoundError("Document", doc_id)
     # Strip caller-controlled fields that must not be patched

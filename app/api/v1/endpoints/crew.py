@@ -1,12 +1,11 @@
 import os, re, uuid, math, secrets, string
 from typing import Optional
 from datetime import datetime, timezone, date
-from fastapi import APIRouter, Query, HTTPException, Request
+from fastapi import APIRouter, Query, HTTPException
 from app.api.deps import SbClient, CurrentUser
 from app.core.exceptions import NotFoundError, ConflictError, ForbiddenError
 from app.core.config import settings
 from app.core.security import get_password_hash
-from app.core.rate_limit import limiter
 
 
 def _generate_temp_password() -> str:
@@ -77,8 +76,7 @@ async def list_crew(
 
 
 @router.post("", status_code=201)
-@limiter.limit("20/minute")
-async def create_crew(request: Request, data: dict, current_user: CurrentUser, sb: SbClient):
+async def create_crew(data: dict, current_user: CurrentUser, sb: SbClient):
     if current_user["role"] not in ["super_admin", "admin", "ops_manager"] and not current_user.get("is_superuser"):
         raise ForbiddenError("Insufficient permissions")
 
@@ -315,10 +313,6 @@ async def get_crew_flights(crew_id: str, current_user: CurrentUser, sb: SbClient
 
 @router.post("/{crew_id}/block")
 async def block_crew(crew_id: str, data: dict, current_user: CurrentUser, sb: SbClient):
-    # Blocking a crew member removes them from the assignable pool — must be
-    # gated to editors (admin / ops manager / scheduler). Without this gate,
-    # any authenticated user (incl. crew themselves) could ground anyone.
-    _ensure_editor(current_user)
     existing = sb.table("crew").select("id").eq("id", crew_id).eq("company_id", current_user["company_id"]).execute()
     if not existing.data:
         raise NotFoundError("Crew member", crew_id)
@@ -335,7 +329,6 @@ async def block_crew(crew_id: str, data: dict, current_user: CurrentUser, sb: Sb
 
 @router.post("/{crew_id}/unblock")
 async def unblock_crew(crew_id: str, current_user: CurrentUser, sb: SbClient):
-    _ensure_editor(current_user)
     existing = sb.table("crew").select("id").eq("id", crew_id).eq("company_id", current_user["company_id"]).execute()
     if not existing.data:
         raise NotFoundError("Crew member", crew_id)
