@@ -191,6 +191,9 @@ async def publish_flight(flight_id: str, current_user: CurrentUser, sb: SbClient
     - Changes publish_status to 'published'
     - Sends in-app notification to all allocators in the same company
     """
+    # Publishing puts a flight into the assignable pool and fans out
+    # notifications to every allocator — strictly an editor action.
+    _ensure_flight_editor(current_user)
     flight_res = sb.table("flights").select("*") \
         .eq("id", flight_id).eq("company_id", current_user["company_id"]).execute()
     if not flight_res.data:

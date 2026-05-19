@@ -313,6 +313,10 @@ async def get_crew_flights(crew_id: str, current_user: CurrentUser, sb: SbClient
 
 @router.post("/{crew_id}/block")
 async def block_crew(crew_id: str, data: dict, current_user: CurrentUser, sb: SbClient):
+    # Blocking a crew member removes them from the assignable pool — must be
+    # gated to editors (admin / ops manager / scheduler). Without this gate,
+    # any authenticated user (incl. crew themselves) could ground anyone.
+    _ensure_editor(current_user)
     existing = sb.table("crew").select("id").eq("id", crew_id).eq("company_id", current_user["company_id"]).execute()
     if not existing.data:
         raise NotFoundError("Crew member", crew_id)
@@ -329,6 +333,7 @@ async def block_crew(crew_id: str, data: dict, current_user: CurrentUser, sb: Sb
 
 @router.post("/{crew_id}/unblock")
 async def unblock_crew(crew_id: str, current_user: CurrentUser, sb: SbClient):
+    _ensure_editor(current_user)
     existing = sb.table("crew").select("id").eq("id", crew_id).eq("company_id", current_user["company_id"]).execute()
     if not existing.data:
         raise NotFoundError("Crew member", crew_id)

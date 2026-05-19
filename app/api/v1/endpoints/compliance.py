@@ -54,6 +54,25 @@ async def get_crew_compliance_status(
 
 
 # ─────────────────────────────────────────────────────────────
+# Role gate — compliance checks expose docs / training expiry / FDP usage,
+# which is sensitive PII. Restrict to operations + compliance staff.
+# ─────────────────────────────────────────────────────────────
+_COMPLIANCE_READERS = {
+    "super_admin", "admin", "ops_manager", "scheduler",
+    "crew_allocator", "cabin_allocator", "cockpit_allocator", "ground_allocator",
+    "compliance_officer", "flight_movement", "flight_ops", "flight_operations",
+    "sched_captain", "sched_copilot", "sched_engineer", "sched_purser",
+    "sched_cabin", "sched_balance", "sched_security", "sched_extra",
+}
+
+
+def _ensure_compliance_reader(user: dict) -> None:
+    if user.get("role") not in _COMPLIANCE_READERS:
+        from app.core.exceptions import ForbiddenError
+        raise ForbiddenError("غير مصرح بإجراء فحص الامتثال")
+
+
+# ─────────────────────────────────────────────────────────────
 # POST /compliance/check-crew/{crew_id}
 # ─────────────────────────────────────────────────────────────
 @router.post("/check-crew/{crew_id}")
@@ -63,6 +82,15 @@ async def check_crew_compliance(
     sb: SbClient,
 ):
     """Trigger a full compliance check for a crew member."""
+    _ensure_compliance_reader(current_user)
+    # Verify the crew member belongs to the caller's company before invoking
+    # the engine — the engine itself takes only crew_id, so without this guard
+    # a cross-tenant lookup would succeed.
+    from app.core.exceptions import NotFoundError
+    crew_check = sb.table("crew").select("id").eq("id", crew_id)\
+        .eq("company_id", current_user["company_id"]).execute()
+    if not crew_check.data:
+        raise NotFoundError("Crew member", crew_id)
     engine = ComplianceEngine(sb)
     return engine.check_crew(crew_id)
 
@@ -87,6 +115,7 @@ async def check_assignment_compliance(
       - Assignment conflict check
       - Rest period check
     """
+    _ensure_compliance_reader(current_user)
     crew_id   = data.get("crew_id")
     flight_id = data.get("flight_id")
 

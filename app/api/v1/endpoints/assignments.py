@@ -17,6 +17,47 @@ COCKPIT_RANKS = frozenset({"captain", "first_officer", "second_officer", "flight
 CABIN_RANKS   = frozenset({"chief", "purser", "senior", "cabin_crew"})
 GROUND_RANKS  = frozenset({"dispatcher", "ground_staff"})
 
+# ── Role gates ────────────────────────────────────────────────────────────────
+# Anyone in `_READERS` may browse the full company-wide assignment list.
+# A logged-in `crew` member is allowed too, but their query is force-narrowed
+# to their own crew_id (see _ensure_assignment_reader below).
+_READERS = {
+    "super_admin", "admin", "ops_manager", "scheduler",
+    "crew_allocator", "cabin_allocator", "cockpit_allocator", "ground_allocator",
+    "compliance_officer", "flight_movement", "flight_ops", "flight_operations",
+    "sched_captain", "sched_copilot", "sched_engineer", "sched_purser",
+    "sched_cabin", "sched_balance", "sched_security", "sched_extra",
+}
+# Only these roles can create / mutate assignments. Allocator sub-rank gates
+# below still apply to limit which crew they can pick.
+_ASSIGNERS = {
+    "super_admin", "admin", "ops_manager", "scheduler",
+    "crew_allocator", "cabin_allocator", "cockpit_allocator", "ground_allocator",
+    "sched_captain", "sched_copilot", "sched_engineer", "sched_purser",
+    "sched_cabin", "sched_balance", "sched_security", "sched_extra",
+}
+
+
+def _ensure_assignment_reader(user: dict) -> Optional[str]:
+    """Return the crew_id the response must be scoped to, or None for full read.
+
+    Raises ForbiddenError if the role is not allowed to view assignments at all.
+    """
+    role = user.get("role")
+    if role in _READERS:
+        return None
+    if role == "crew":
+        own = user.get("crew_id")
+        if not own:
+            raise ForbiddenError("Crew account is not linked to a roster record")
+        return own
+    raise ForbiddenError("غير مصرح بعرض التعيينات")
+
+
+def _ensure_assigner(user: dict) -> None:
+    if user.get("role") not in _ASSIGNERS:
+        raise ForbiddenError("غير مصرح بتعيين الطاقم")
+
 
 @router.get("")
 async def get_assignments(
@@ -34,6 +75,7 @@ async def get_assignments(
     via a PostgREST inner-join on flights, which embeds the flight as
     `flights` on every row.
     """
+    forced_crew_id = _ensure_assignment_reader(current_user)
     company_id = current_user["company_id"]
 
     q = sb.table("assignments") \
@@ -41,7 +83,11 @@ async def get_assignments(
         .eq("flights.company_id", company_id)
     if flight_id:
         q = q.eq("flight_id", flight_id)
-    if crew_id:
+    # For `crew` role, force-narrow to their own crew_id regardless of what
+    # they passed. For ops staff, honour the optional filter.
+    if forced_crew_id is not None:
+        q = q.eq("crew_id", forced_crew_id)
+    elif crew_id:
         q = q.eq("crew_id", crew_id)
     result = q.limit(page_size).execute()
     rows = result.data or []
@@ -66,6 +112,9 @@ async def get_assignments(
 
 @router.post("", status_code=201)
 async def assign_crew(data: dict, current_user: CurrentUser, sb: SbClient):
+    # Top-level role gate. Allocator-rank limits (below) still apply, but
+    # without this gate anyone holding a token could create assignments.
+    _ensure_assigner(current_user)
     flight_id = data["flight_id"]
     crew_id = data["crew_id"]
     is_override = data.get("is_override", False)
@@ -280,6 +329,10 @@ async def assign_crew(data: dict, current_user: CurrentUser, sb: SbClient):
 
 @router.delete("/{assignment_id}")
 async def remove_assignment(assignment_id: str, current_user: CurrentUser, sb: SbClient):
+    # Removing an assignment is a scheduling action — same gate as creating
+    # one. Crew should use /decline if they cannot fly; deletion erases the
+    # audit trail and must stay with ops.
+    _ensure_assigner(current_user)
     existing = sb.table("assignments").select("id,flight_id").eq("id", assignment_id).execute()
     if not existing.data:
         raise NotFoundError("Assignment", assignment_id)
@@ -297,25 +350,44 @@ async def remove_assignment(assignment_id: str, current_user: CurrentUser, sb: S
 
 @router.get("/flight/{flight_id}")
 async def get_flight_assignments(flight_id: str, current_user: CurrentUser, sb: SbClient):
+    # Crew can only call this for a flight they themselves are on. Ops staff
+    # see the whole roster for the flight.
+    forced_crew_id = _ensure_assignment_reader(current_user)
     flight_check = sb.table("flights").select("id").eq("id", flight_id).eq("company_id", current_user["company_id"]).execute()
     if not flight_check.data:
         raise NotFoundError("Flight", flight_id)
+    if forced_crew_id is not None:
+        own_row = sb.table("assignments").select("id").eq("flight_id", flight_id).eq("crew_id", forced_crew_id).limit(1).execute()
+        if not own_row.data:
+            raise ForbiddenError("غير مصرح بعرض طاقم رحلة لست ضمنها")
     result = sb.table("assignments").select("*, crew(full_name_ar, full_name_en, rank, employee_id)").eq("flight_id", flight_id).execute()
     return result.data
 
 
 @router.post("/{assignment_id}/acknowledge")
 async def acknowledge_assignment(assignment_id: str, current_user: CurrentUser, sb: SbClient):
-    existing = sb.table("assignments").select("id,flight_id").eq("id", assignment_id).execute()
+    existing = sb.table("assignments").select("id,flight_id,crew_id").eq("id", assignment_id).execute()
     if not existing.data:
         raise NotFoundError("Assignment", assignment_id)
 
+    row = existing.data[0]
+
     # Verify the assignment's flight belongs to this company
-    flight_id = existing.data[0].get("flight_id")
+    flight_id = row.get("flight_id")
     if flight_id:
         flight_check = sb.table("flights").select("id").eq("id", flight_id).eq("company_id", current_user["company_id"]).execute()
         if not flight_check.data:
             raise NotFoundError("Assignment", assignment_id)
+
+    # Crew can only acknowledge their own row. Ops staff (admin / ops_manager /
+    # scheduler) can ack on behalf of crew when, e.g., they get verbal
+    # confirmation in the OCC. Any other role is rejected outright.
+    role = current_user.get("role")
+    if role == "crew":
+        if current_user.get("crew_id") != row.get("crew_id"):
+            raise ForbiddenError("Cannot acknowledge another crew member's assignment")
+    elif role not in {"super_admin", "admin", "ops_manager", "scheduler"}:
+        raise ForbiddenError("غير مصرح بتأكيد التعيين")
 
     result = sb.table("assignments").update({
         "acknowledged": True,

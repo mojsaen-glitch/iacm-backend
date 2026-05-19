@@ -1,8 +1,24 @@
 """
 Seed script - runs once to populate the database with initial data.
-Usage: python -m app.db.seed
+
+DEVELOPMENT / STAGING USE ONLY. This script is gated behind the
+`ALLOW_SEED=1` environment variable so it cannot run in production by
+accident. Seed-user passwords are also read from env vars so this file
+contains no static credentials.
+
+Usage:
+    # local dev:
+    export ALLOW_SEED=1
+    export SEED_ADMIN_PASSWORD='...'        # required, no default
+    export SEED_OPSMGR_PASSWORD='...'       # required
+    export SEED_SCHED_PASSWORD='...'        # required
+    export SEED_COMP_PASSWORD='...'         # required
+    export SEED_FLIGHTOPS_PASSWORD='...'    # required
+    python -m app.db.seed
 """
 import asyncio
+import os
+import sys
 import uuid
 from datetime import date, datetime, timezone, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,8 +32,38 @@ from app.models.aircraft import Aircraft
 from app.core.security import get_password_hash
 
 
+def _required_env(name: str) -> str:
+    """Return env var or abort. Centralised so the error message is identical
+    everywhere and we never silently fall back to a baked-in default."""
+    val = os.environ.get(name)
+    if not val:
+        print(
+            f"ERROR: env var {name} is required to seed. Refusing to use a "
+            f"hard-coded default. See seed.py docstring for the full list.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return val
+
+
 async def seed(db: AsyncSession):
+    if os.environ.get("ALLOW_SEED") != "1":
+        print(
+            "ERROR: seeding is disabled. Set ALLOW_SEED=1 to confirm this is "
+            "NOT a production environment, then re-run.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     print("Seeding database...")
+
+    # Pull seed passwords from env. No defaults — if anyone forgets to set
+    # one, refusing is safer than minting a known-weak credential.
+    pw_admin     = _required_env("SEED_ADMIN_PASSWORD")
+    pw_opsmgr    = _required_env("SEED_OPSMGR_PASSWORD")
+    pw_sched     = _required_env("SEED_SCHED_PASSWORD")
+    pw_comp      = _required_env("SEED_COMP_PASSWORD")
+    pw_flightops = _required_env("SEED_FLIGHTOPS_PASSWORD")
 
     # Company
     company = Company(
@@ -37,15 +83,15 @@ async def seed(db: AsyncSession):
 
     # Users
     users = [
-        User(id=str(uuid.uuid4()), email="admin@iraqiairways.iq", hashed_password=get_password_hash("admin123"),
+        User(id=str(uuid.uuid4()), email="admin@iraqiairways.iq", hashed_password=get_password_hash(pw_admin),
              name_ar="مدير النظام", name_en="System Admin", role="super_admin", company_id=cid, is_superuser=True),
-        User(id=str(uuid.uuid4()), email="supervisor@iraqiairways.iq", hashed_password=get_password_hash("super123"),
+        User(id=str(uuid.uuid4()), email="supervisor@iraqiairways.iq", hashed_password=get_password_hash(pw_opsmgr),
              name_ar="مدير العمليات", name_en="Operations Manager", role="ops_manager", company_id=cid),
-        User(id=str(uuid.uuid4()), email="scheduler@iraqiairways.iq", hashed_password=get_password_hash("sched123"),
+        User(id=str(uuid.uuid4()), email="scheduler@iraqiairways.iq", hashed_password=get_password_hash(pw_sched),
              name_ar="مسؤول الجدولة", name_en="Scheduler", role="scheduler", company_id=cid),
-        User(id=str(uuid.uuid4()), email="compliance@iraqiairways.iq", hashed_password=get_password_hash("comp123"),
+        User(id=str(uuid.uuid4()), email="compliance@iraqiairways.iq", hashed_password=get_password_hash(pw_comp),
              name_ar="ضابط الامتثال", name_en="Compliance Officer", role="compliance_officer", company_id=cid),
-        User(id=str(uuid.uuid4()), email="flights@iraqiairways.iq", hashed_password=get_password_hash("flights123"),
+        User(id=str(uuid.uuid4()), email="flights@iraqiairways.iq", hashed_password=get_password_hash(pw_flightops),
              name_ar="عمليات الطيران", name_en="Flight Operations", role="flight_ops", company_id=cid),
     ]
     for u in users:
