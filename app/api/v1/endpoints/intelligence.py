@@ -135,7 +135,17 @@ async def _fetch_metar_checkwx(icao: str, api_key: str) -> Optional[dict]:
     wspd_kt = wind.get("speed_kts")
     wgst_kt = wind.get("gust_kts")
     wdir    = wind.get("degrees")
-    vis     = (r.get("visibility") or {}).get("meters_float")
+    # Visibility: CheckWX returns 0 for "CAVOK" / unlimited visibility
+    # (raw METAR has `9999` or `CAVOK`). Translate that to the standard
+    # 9999 m (10+ km) so the ops_impact heuristic doesn't false-positive.
+    raw_text = (r.get("raw_text") or "").upper()
+    vis_obj  = r.get("visibility") or {}
+    vis      = vis_obj.get("meters_float")
+    if vis == 0 and ("CAVOK" in raw_text or "9999" in raw_text):
+        vis = 9999
+    elif vis == 0:
+        # Genuine zero (fog) — keep as 0 so ops_impact flags it.
+        pass
     altim   = (r.get("barometer")  or {}).get("hpa")
     clouds  = [{
         "cover": (c.get("code") or "").upper(),
@@ -198,8 +208,13 @@ async def _fetch_metar(icao: str) -> Optional[dict]:
     metar: Optional[dict] = None
     if api_key:
         metar = await _fetch_metar_checkwx(icao, api_key)
-    if metar is None:
-        metar = await _fetch_metar_avwx(icao)
+    # Fall through to AviationWeather if CheckWX returned nothing OR if
+    # the response is missing the essentials (some small airfields show
+    # up in CheckWX with an empty payload — temp/wind both None).
+    if metar is None or (metar.get("temp") is None and metar.get("wspd") is None):
+        avwx = await _fetch_metar_avwx(icao)
+        if avwx is not None:
+            metar = avwx
 
     if metar is not None:
         _WEATHER_CACHE[icao] = (now, metar)
