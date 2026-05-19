@@ -19,6 +19,7 @@ from app.api.v1.endpoints import (
     safety,
     irops,
     bidding,
+    intelligence,
 )
 
 api_router = APIRouter()
@@ -42,3 +43,4 @@ api_router.include_router(aircraft.router)
 api_router.include_router(safety.router)
 api_router.include_router(irops.router)
 api_router.include_router(bidding.router)
+api_router.include_router(intelligence.router)
