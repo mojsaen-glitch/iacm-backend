@@ -37,6 +37,32 @@ log = logging.getLogger(__name__)
 _WEATHER_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 CACHE_TTL_SECONDS = 600  # 10 minutes — fresh enough for ops, cheap enough for the quota
 
+# SIGMETs change less often than METAR — 15-minute cache is plenty.
+_SIGMET_CACHE: Tuple[float, list] = (0.0, [])
+SIGMET_TTL_SECONDS = 900
+
+# FIRs (Flight Information Regions) that overlap the Iraqi Airways
+# network. Used to filter the global SIGMET feed down to what we care
+# about. Letter codes are standard ICAO.
+_RELEVANT_FIRS = {
+    "ORBB",  # Baghdad
+    "OEJD", "OERR",  # Saudi Arabia
+    "OKAC",  # Kuwait
+    "OBBB",  # Bahrain
+    "OOMM",  # Muscat (UAE/Oman corridor)
+    "OMAE",  # Emirates
+    "OTDF",  # Doha
+    "OJAC",  # Jordan
+    "OLBB",  # Lebanon
+    "HECC",  # Cairo
+    "LLLL",  # Israel/Palestine air space
+    "LTAA", "LTBB",  # Turkey
+    "OIIX",  # Iran
+    "VIDF",  # Delhi
+    "EDGG", "EDFF",  # Frankfurt
+    "EGTT", "EGPX",  # London
+}
+
 
 # ──────────────────────────────────────────────────────────────────────
 # IATA → ICAO mapping for the Iraqi Airways network.
@@ -374,6 +400,105 @@ def _ops_impact(wmo: int, vis_m: Optional[float], wind_kmh: Optional[float],
         "risk":    risk,
         "factors": factors or ["ظروف طبيعية"],
     }
+
+
+# ──────────────────────────────────────────────────────────────────────
+# AIRSIGMETs — critical weather warnings
+# ──────────────────────────────────────────────────────────────────────
+
+async def _fetch_global_sigmets() -> list:
+    """Pull every active SIGMET/AIRMET from AviationWeather.gov, return
+    the raw JSON list. Used as the source for the filtered endpoint."""
+    url = "https://aviationweather.gov/api/data/airsigmet?format=json"
+    try:
+        async with httpx.AsyncClient(
+            timeout=10.0,
+            headers={"User-Agent": "IACM-FlightOps/1.0"},
+        ) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        log.warning("Global SIGMET fetch failed: %s", e)
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _classify_sigmet_hazard(hazard: str) -> Tuple[str, str]:
+    """Map a SIGMET hazard code to (icon_class, Arabic label)."""
+    h = (hazard or "").upper().strip()
+    if "TURB" in h:    return ("turbulence", "اضطرابات")
+    if "ICE" in h:     return ("icing",      "تجلّد")
+    if "MTW" in h:     return ("mountain",   "موجات جبلية")
+    if "TS" in h:      return ("storm",      "عواصف رعدية")
+    if "VA" in h:      return ("ash",        "رماد بركاني")
+    if "SS" in h or "DS" in h: return ("dust", "غبار/عاصفة رملية")
+    if "TC" in h or "TROPICAL" in h: return ("cyclone", "إعصار")
+    if "IFR" in h:     return ("ifr",        "ظروف IFR")
+    return ("other", h or "تحذير")
+
+
+@router.get("/sigmets")
+async def list_sigmets(current_user: CurrentUser, sb: SbClient):
+    """Active SIGMETs affecting the Iraqi Airways network footprint.
+
+    Returns a filtered, simplified view of the global AviationWeather
+    SIGMET feed — only entries whose FIR is in _RELEVANT_FIRS or whose
+    raw text mentions a station we operate to.
+
+    The dispatcher gets:
+      • hazard type (TURB / ICE / MTW / TS / VA / ...)
+      • Arabic label
+      • severity (the rawSigmet "Severity" column, or derived)
+      • valid_from / valid_to
+      • affected area (FIR + text excerpt)
+      • raw text (so the dispatcher can argue with our parser)
+    """
+    global _SIGMET_CACHE
+    now = time.time()
+    if _SIGMET_CACHE[1] and (now - _SIGMET_CACHE[0]) < SIGMET_TTL_SECONDS:
+        return _SIGMET_CACHE[1]
+
+    raw = await _fetch_global_sigmets()
+
+    # Build a station-code keyword set so we catch SIGMETs that mention
+    # an Iraqi-Airways airport in their freeform text even if the FIR
+    # filter misses (the FIR code list is a moving target).
+    station_codes = set(_IATA_TO_ICAO.values()) | set(_IATA_TO_ICAO.keys())
+
+    relevant = []
+    for s in raw:
+        fir   = (s.get("firId") or "").upper()
+        body  = (s.get("rawAirSigmet") or s.get("raw") or "").upper()
+        hits = (fir in _RELEVANT_FIRS) or any(c in body for c in station_codes)
+        if not hits:
+            continue
+
+        cls, label = _classify_sigmet_hazard(s.get("hazard") or "")
+        relevant.append({
+            "id":          s.get("airSigmetId") or s.get("hash") or f"sigmet-{len(relevant)}",
+            "type":        cls,
+            "hazard":      s.get("hazard"),
+            "label_ar":    label,
+            "severity":    s.get("severity") or "NORMAL",
+            "fir":         fir or None,
+            "valid_from":  s.get("validTimeFrom"),
+            "valid_to":    s.get("validTimeTo"),
+            "altitude_lo": s.get("altitudeLow1"),
+            "altitude_hi": s.get("altitudeHi1"),
+            "movement":    s.get("movementDir"),
+            "raw":         s.get("rawAirSigmet") or s.get("raw"),
+        })
+
+    # Sort: most severe first, then most recent
+    severity_order = {"SEVERE": 0, "MODERATE": 1, "NORMAL": 2}
+    relevant.sort(key=lambda r: (
+        severity_order.get((r.get("severity") or "").upper(), 3),
+        -(r.get("valid_from") or 0),
+    ))
+
+    _SIGMET_CACHE = (now, relevant)
+    return relevant
 
 
 @router.get("/weather")
