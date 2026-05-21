@@ -62,6 +62,24 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "Accept", "X-Company-ID"],
 )
 
+
+# Security response headers — defense-in-depth on every response.
+#   • nosniff           : stops browsers MIME-sniffing a JSON body into HTML/JS.
+#   • DENY framing      : clickjacking protection (no surface needs to be framed).
+#   • Referrer-Policy   : don't leak full URLs (which may carry ?token=) cross-site.
+#   • X-XSS-Protection 0: modern guidance — disable the buggy legacy IE/Chrome filter.
+# HSTS is already set at the Vercel edge, so we don't duplicate it. CSP is
+# intentionally omitted: a strict policy would break the Swagger UI's CDN assets
+# at /api/docs, and every other response is JSON consumed by the Flutter client.
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["X-XSS-Protection"] = "0"
+    return response
+
 # Authenticated download endpoint replaces the previous unauthenticated
 # StaticFiles mount on /uploads. We pass JWT as Authorization header OR as a
 # `?token=` query param so <img> tags can still load avatars/photos.
