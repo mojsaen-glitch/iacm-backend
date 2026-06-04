@@ -1,5 +1,5 @@
 import uuid, math, logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, Query, HTTPException
 from app.api.deps import SbClient, CurrentUser
 from app.core.exceptions import ForbiddenError, NotFoundError
@@ -11,6 +11,56 @@ router = APIRouter(prefix="/notifications", tags=["Notifications"])
 # Roles allowed to send notifications to others
 SENDER_ROLES = {"super_admin", "admin", "ops_manager"}
 VALID_PLATFORMS = {"android", "ios", "web", "windows"}
+
+# ── Notification-delivery monitoring ─────────────────────────────────────────
+# Roles allowed to view the delivery dashboard for a flight (ops + every
+# scheduler tier — they're the ones who need to see if crew got the roster).
+DELIVERY_VIEWER_ROLES = SENDER_ROLES | {
+    "scheduler", "scheduler_admin",
+    "sched_captain", "sched_copilot", "sched_engineer", "sched_purser",
+    "sched_cabin", "sched_balance", "sched_security", "sched_extra",
+    "crew_allocator", "cabin_allocator", "cockpit_allocator", "ground_allocator",
+}
+_DELIVERY_CONFIRM_DEADLINE = timedelta(minutes=3)   # no delivered ACK → not confirmed
+_READ_DEADLINE            = timedelta(minutes=10)   # delivered but unread → overdue
+
+
+def _parse_ts(ts):
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _apply_delivery_timeouts(sb, rows: list) -> list:
+    """Lazily transition stale delivery rows (no cron needed — runs when the
+    dashboard is queried, mirroring the flights advance-statuses pattern):
+      • sent & no delivered_at & >3min  → delivery_not_confirmed
+      • delivered & no read_at & >10min → unread_after_deadline
+    Persists each transition best-effort and returns the (mutated) rows."""
+    now = datetime.now(timezone.utc)
+    for r in rows:
+        new_status = None
+        st = r.get("status")
+        if st == "sent" and not r.get("delivered_at"):
+            sent = _parse_ts(r.get("sent_at"))
+            if sent and (now - sent) > _DELIVERY_CONFIRM_DEADLINE:
+                new_status = "delivery_not_confirmed"
+        elif st == "delivered" and not r.get("read_at"):
+            dlv = _parse_ts(r.get("delivered_at"))
+            if dlv and (now - dlv) > _READ_DEADLINE:
+                new_status = "unread_after_deadline"
+        if new_status:
+            r["status"] = new_status
+            try:
+                sb.table("notification_delivery").update(
+                    {"status": new_status, "updated_at": now.isoformat()}
+                ).eq("id", r["id"]).execute()
+            except Exception as e:
+                log.warning("delivery timeout update failed (%s): %s", r.get("id"), e)
+    return rows
 
 
 # ─── GET /notifications ──────────────────────────────────────────
@@ -122,15 +172,70 @@ async def send_notification(data: dict, current_user: CurrentUser, sb: SbClient)
 # ─── POST /notifications/{id}/read ───────────────────────────────
 @router.post("/{notification_id}/read")
 async def mark_read(notification_id: str, current_user: CurrentUser, sb: SbClient):
-    """يسمح فقط لصاحب الإشعار بتحديده كمقروء."""
+    """يسمح فقط لصاحب الإشعار بتحديده كمقروء. يحدّث سجل التوصيل أيضاً (READ ACK)."""
+    now = datetime.now(timezone.utc).isoformat()
     result = sb.table("notifications").update({
         "is_read": True,
-        "read_at": datetime.now(timezone.utc).isoformat(),
+        "read_at": now,
     }).eq("id", notification_id).eq("user_id", current_user["id"]).execute()
 
     if not result.data:
         raise NotFoundError("Notification", notification_id)
+
+    # Delivery monitoring: reading implies delivery — stamp both if unset.
+    # Best-effort: a missing notification_delivery table must never break read.
+    try:
+        sb.table("notification_delivery").update({
+            "status": "read", "read_at": now, "updated_at": now,
+        }).eq("notification_id", notification_id) \
+          .eq("user_id", current_user["id"]).is_("read_at", "null").execute()
+    except Exception as e:
+        log.warning("mark_read delivery update failed (%s): %s", notification_id, e)
     return {"message": "تم تحديد الإشعار كمقروء"}
+
+
+@router.post("/{notification_id}/ack-delivered")
+async def ack_delivered(notification_id: str, current_user: CurrentUser, sb: SbClient):
+    """تطبيق الطاقم يستدعيه فور استلام الإشعار (DELIVERED ACK). يضبط delivered_at
+    وحالة delivered للمرة الأولى فقط (idempotent)."""
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        sb.table("notification_delivery").update({
+            "status": "delivered", "delivered_at": now, "updated_at": now,
+        }).eq("notification_id", notification_id) \
+          .eq("user_id", current_user["id"]) \
+          .is_("delivered_at", "null") \
+          .in_("status", ["sent", "failed", "delivery_not_confirmed"]).execute()
+    except Exception as e:
+        log.warning("ack_delivered failed (%s): %s", notification_id, e)
+    return {"ok": True}
+
+
+@router.get("/delivery")
+async def delivery_status(
+    current_user: CurrentUser,
+    sb: SbClient,
+    flight_id: str = Query(..., min_length=1),
+):
+    """لوحة الجدولة: حالة توصيل إشعارات تكليف الطاقم لرحلة معيّنة، لكل فرد.
+    يطبّق التحويلات الزمنية (3د/10د) lazily قبل الإرجاع."""
+    if current_user["role"] not in DELIVERY_VIEWER_ROLES:
+        raise ForbiddenError("عرض حالة التوصيل متاح للجدولة/الإدارة فقط")
+    rows = sb.table("notification_delivery").select("*") \
+        .eq("flight_id", flight_id).order("sent_at", desc=True).execute().data or []
+    rows = _apply_delivery_timeouts(sb, rows)
+    # Attach crew display name/roster for the dashboard.
+    crew_ids = list({r["crew_id"] for r in rows if r.get("crew_id")})
+    names: dict = {}
+    if crew_ids:
+        cres = sb.table("crew").select("id,full_name_ar,full_name_en,roster_name") \
+            .in_("id", crew_ids).execute().data or []
+        names = {c["id"]: c for c in cres}
+    for r in rows:
+        c = names.get(r.get("crew_id")) or {}
+        r["crew_name"]   = c.get("full_name_ar") or c.get("full_name_en")
+        r["roster_name"] = c.get("roster_name")
+    return rows
 
 
 # ─── GET /notifications/unread/count ─────────────────────────────

@@ -16,13 +16,34 @@ def get_password_hash(password: str) -> str:
     return _bcrypt.hashpw(password.encode(), _bcrypt.gensalt()).decode()
 
 
-def create_access_token(subject: Union[str, dict], expires_delta: Optional[timedelta] = None) -> str:
-    if expires_delta:
+def create_access_token(
+    subject: Union[str, dict],
+    expires_delta: Optional[timedelta] = None,
+    *,
+    expires_minutes: Optional[int] = None,
+    extra_claims: Optional[dict] = None,
+) -> str:
+    """JWT access token factory.
+
+    Backwards-compatible: existing callers pass only `subject` (and
+    optionally `expires_delta`). The keyword-only `expires_minutes` and
+    `extra_claims` let the 2FA challenge flow mint a short-lived,
+    purpose-tagged token without forcing every caller to construct a
+    timedelta or hand-merge claim dicts.
+    """
+    if expires_delta is not None:
         expire = datetime.now(timezone.utc) + expires_delta
+    elif expires_minutes is not None:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=expires_minutes)
     else:
         expire = datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
 
     to_encode = {"exp": expire, "sub": str(subject), "type": "access"}
+    if extra_claims:
+        # Don't let a caller silently override `exp`/`sub`/`type`.
+        for k, v in extra_claims.items():
+            if k not in ("exp", "sub", "type"):
+                to_encode[k] = v
     return jwt.encode(to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
 

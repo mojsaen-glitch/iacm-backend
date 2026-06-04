@@ -16,6 +16,7 @@ class Flight(BaseModel):
     arrival_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     duration_hours: Mapped[float] = mapped_column(Float, nullable=False)
     crew_required: Mapped[int] = mapped_column(Integer, default=4)
+    standby_required: Mapped[int] = mapped_column(Integer, default=0)
 
     # Status
     status: Mapped[str] = mapped_column(String(30), default="scheduled", index=True)

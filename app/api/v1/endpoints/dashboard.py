@@ -14,13 +14,16 @@ async def get_dashboard_stats(current_user: CurrentUser, sb: SbClient):
     warning_date = (today + timedelta(days=30)).isoformat()
     week_start = (today - timedelta(days=6)).isoformat()
 
-    # Crew stats
-    crew_result = sb.table("crew").select("status", count="exact").eq("company_id", company_id).execute()
-    all_crew = crew_result.data or []
-    total_crew = len(all_crew)
-    active_crew = sum(1 for c in all_crew if c["status"] in ["active", "in_flight", "standby"])
-    blocked_crew = sum(1 for c in all_crew if c["status"] == "blocked")
-    on_leave = sum(1 for c in all_crew if c["status"] == "on_leave")
+    # Crew stats — EXACT count via Content-Range (Prefer: count=exact) with
+    # limit(1) so only the count is used, not the rows. This keeps the Tier-1 goal
+    # (no fetch-all, correct beyond 1000 crew) WITHOUT head=True — the deployed
+    # supabase-py does not populate .count on HEAD requests, which returned 0.
+    def _crew_count():
+        return sb.table("crew").select("id", count="exact").eq("company_id", company_id).limit(1)
+    total_crew   = _crew_count().execute().count or 0
+    active_crew  = _crew_count().in_("status", ["active", "in_flight", "standby"]).execute().count or 0
+    blocked_crew = _crew_count().eq("status", "blocked").execute().count or 0
+    on_leave     = _crew_count().eq("status", "on_leave").execute().count or 0
 
     # Flight stats today (fetch id + status so we can later join assignments)
     flights_result = sb.table("flights").select("id,status").eq("company_id", company_id)\
@@ -30,11 +33,11 @@ async def get_dashboard_stats(current_user: CurrentUser, sb: SbClient):
     flights_in_air = sum(1 for f in flights_today if f["status"] == "in_air")
     flights_scheduled = sum(1 for f in flights_today if f["status"] in ["scheduled", "boarding"])
 
-    # Document alerts
+    # Document alerts — exact count + limit(1) (no head=True; see crew note above).
     docs_expiring = sb.table("documents").select("id", count="exact")\
-        .lte("expiry_date", warning_date).gte("expiry_date", today_str).execute()
+        .lte("expiry_date", warning_date).gte("expiry_date", today_str).limit(1).execute()
     docs_expired = sb.table("documents").select("id", count="exact")\
-        .lt("expiry_date", today_str).execute()
+        .lt("expiry_date", today_str).limit(1).execute()
 
     compliance_rate = round(((total_crew - blocked_crew) / total_crew * 100) if total_crew > 0 else 100.0, 1)
 

@@ -25,6 +25,8 @@ email-validator==2.2.0
 # File handling
 aiofiles==24.1.0
 pillow==11.1.0
+# Excel export — Crew Monthly Flight Hours Matrix (professional 5-sheet workbook).
+openpyxl==3.1.5
 
 # Utilities
 python-dateutil==2.9.0
@@ -39,3 +41,13 @@ babel==2.16.0
 # When FIREBASE_SERVICE_ACCOUNT_JSON env var is unset, push_service falls
 # back to STUB mode and the import is never reached (lazy).
 firebase-admin==6.6.0
+
+# Observability dashboard (Phase 1).
+# JSON-formatted logs so the dashboard + downstream log shippers can parse
+# them without regex; APScheduler runs the metrics rollup + retention pruner
+# inside the API process; psutil reads host CPU/RAM/disk for /admin/health.
+python-json-logger==2.0.7
+APScheduler==3.10.4
+psutil==6.1.1
+# 2FA TOTP — RFC 6238 codes (Google Authenticator / Authy / 1Password).
+pyotp==2.9.0

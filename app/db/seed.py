@@ -135,8 +135,15 @@ async def seed(db: AsyncSession):
         crew_ids.append(crew.id)
     await db.flush()
 
-    # Create crew users for first 2 crew members
-    for i, (crew_id, email, password) in enumerate(zip(crew_ids[:2], ["crew1@iraqiairways.iq", "crew2@iraqiairways.iq"], ["crew123", "crew456"])):
+    # Crew login accounts are optional — created only when their password is
+    # supplied via env. No static credentials live in this file.
+    crew_logins = [
+        ("crew1@iraqiairways.iq", os.environ.get("SEED_CREW1_PASSWORD")),
+        ("crew2@iraqiairways.iq", os.environ.get("SEED_CREW2_PASSWORD")),
+    ]
+    for i, ((email, password), crew_id) in enumerate(zip(crew_logins, crew_ids[:2])):
+        if not password:
+            continue
         cu = User(id=str(uuid.uuid4()), email=email, hashed_password=get_password_hash(password),
                   name_ar=crew_data[i]["full_name_ar"], name_en=crew_data[i]["full_name_en"],
                   role="crew", company_id=cid, crew_id=crew_id)
@@ -175,13 +182,15 @@ async def seed(db: AsyncSession):
         db.add(f)
 
     await db.commit()
+    crew_login_count = sum(1 for _, pw in crew_logins if pw)
     print(f"✓ Company: Iraqi Airways (ID: {cid})")
-    print(f"✓ Users: {len(users) + 2} created")
+    print(f"✓ Users: {len(users) + crew_login_count} created")
     print(f"✓ Crew: {len(crew_data)} members")
     print(f"✓ Aircraft: {len(aircraft_list)} registered")
     print(f"✓ Flights: {len(flights)} created")
     print(f"✓ Documents: {len(docs)} created")
-    print("\nSeed completed. Login credentials are defined in this script's source — review it directly.")
+    print("\nSeed completed. Accounts use the passwords supplied via the SEED_* "
+          "env vars — they are not stored or printed by this script.")
 
 
 async def main():

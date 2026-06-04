@@ -1,12 +1,54 @@
-"""Seed Supabase database with initial IACM data"""
+"""Seed Supabase database with initial IACM data.
+
+DEVELOPMENT / STAGING USE ONLY. Gated behind ALLOW_SEED=1 so it can never run
+in production by accident. The Supabase URL + service-role key and every seed
+password are read from the environment — this file contains NO static
+credentials. Mirror of `app.db.seed` for the Supabase REST client path.
+
+Usage:
+    export ALLOW_SEED=1
+    export SUPABASE_URL='https://YOUR_PROJECT_ID.supabase.co'
+    export SUPABASE_SERVICE_KEY='...'           # service_role key
+    export SEED_ADMIN_PASSWORD='...'            # required
+    export SEED_OPSMGR_PASSWORD='...'           # required
+    export SEED_SCHED_PASSWORD='...'            # required
+    export SEED_COMP_PASSWORD='...'             # required
+    export SEED_FLIGHTOPS_PASSWORD='...'        # required
+    export SEED_CREW1_PASSWORD='...'            # optional (skipped if unset)
+    export SEED_CREW2_PASSWORD='...'            # optional (skipped if unset)
+    python seed_supabase.py
+"""
+import os
+import sys
 import uuid
 from datetime import date, datetime, timezone, timedelta
 from supabase import create_client
 import bcrypt as _bcrypt
 
 
-SUPABASE_URL = "https://hfqwzibamphaphdkjpue.supabase.co"
-SERVICE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhmcXd6aWJhbXBoYXBoZGtqcHVlIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3ODQzOTk5OSwiZXhwIjoyMDk0MDE1OTk5fQ.Dgt6NojwaBXLvkA2sr3Mc1pxkbpZh4badwhpvEjn9a8"
+def _required_env(name: str) -> str:
+    """Return env var or abort — never fall back to a baked-in default."""
+    val = os.environ.get(name)
+    if not val:
+        print(
+            f"ERROR: env var {name} is required to seed. Refusing to use a "
+            f"hard-coded default. See this script's docstring for the full list.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return val
+
+
+if os.environ.get("ALLOW_SEED") != "1":
+    print(
+        "ERROR: seeding is disabled. Set ALLOW_SEED=1 to confirm this is NOT a "
+        "production environment, then re-run.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+SUPABASE_URL = _required_env("SUPABASE_URL")
+SERVICE_KEY = _required_env("SUPABASE_SERVICE_KEY")
 
 sb = create_client(SUPABASE_URL, SERVICE_KEY)
 def hash_pw(p): return _bcrypt.hashpw(p.encode(), _bcrypt.gensalt()).decode()
@@ -57,22 +99,29 @@ sb.table("crew").insert(crew_rows).execute()
 print("[OK] Crew: 5 members added")
 
 # ── Users ────────────────────────────────────────────────────────────────
+# Staff passwords are required from env (no static defaults — these are real
+# logins). Crew login accounts are optional and skipped unless their password
+# env var is provided.
 user_rows = [
-    {"id": uid(), "email": "admin@iraqiairways.iq",      "name_ar": "مدير النظام",      "name_en": "System Admin",        "role": "super_admin",       "is_superuser": True,  "hashed_password": hash_pw("admin123")},
-    {"id": uid(), "email": "supervisor@iraqiairways.iq", "name_ar": "مدير العمليات",    "name_en": "Operations Manager",  "role": "ops_manager",       "is_superuser": False, "hashed_password": hash_pw("super123")},
-    {"id": uid(), "email": "scheduler@iraqiairways.iq",  "name_ar": "مسؤول الجدولة",   "name_en": "Scheduler",           "role": "scheduler",         "is_superuser": False, "hashed_password": hash_pw("sched123")},
-    {"id": uid(), "email": "compliance@iraqiairways.iq", "name_ar": "ضابط الامتثال",   "name_en": "Compliance Officer",  "role": "compliance_officer","is_superuser": False, "hashed_password": hash_pw("comp123")},
-    {"id": uid(), "email": "flights@iraqiairways.iq",    "name_ar": "عمليات الطيران",  "name_en": "Flight Operations",   "role": "flight_ops",        "is_superuser": False, "hashed_password": hash_pw("flights123")},
-    {"id": uid(), "email": "crew1@iraqiairways.iq",      "name_ar": "سارة أحمد الجابري","name_en": "Sara Ahmed Al-Jaberi","role": "crew",              "is_superuser": False, "hashed_password": hash_pw("crew123"),  "crew_id": cr1},
-    {"id": uid(), "email": "crew2@iraqiairways.iq",      "name_ar": "محمد علي الخزاعي","name_en": "Mohammed Ali Al-Khazaei","role": "crew",            "is_superuser": False, "hashed_password": hash_pw("crew456"),  "crew_id": cr2},
+    {"id": uid(), "email": "admin@iraqiairways.iq",      "name_ar": "مدير النظام",      "name_en": "System Admin",        "role": "super_admin",       "is_superuser": True,  "hashed_password": hash_pw(_required_env("SEED_ADMIN_PASSWORD"))},
+    {"id": uid(), "email": "supervisor@iraqiairways.iq", "name_ar": "مدير العمليات",    "name_en": "Operations Manager",  "role": "ops_manager",       "is_superuser": False, "hashed_password": hash_pw(_required_env("SEED_OPSMGR_PASSWORD"))},
+    {"id": uid(), "email": "scheduler@iraqiairways.iq",  "name_ar": "مسؤول الجدولة",   "name_en": "Scheduler",           "role": "scheduler",         "is_superuser": False, "hashed_password": hash_pw(_required_env("SEED_SCHED_PASSWORD"))},
+    {"id": uid(), "email": "compliance@iraqiairways.iq", "name_ar": "ضابط الامتثال",   "name_en": "Compliance Officer",  "role": "compliance_officer","is_superuser": False, "hashed_password": hash_pw(_required_env("SEED_COMP_PASSWORD"))},
+    {"id": uid(), "email": "flights@iraqiairways.iq",    "name_ar": "عمليات الطيران",  "name_en": "Flight Operations",   "role": "flight_ops",        "is_superuser": False, "hashed_password": hash_pw(_required_env("SEED_FLIGHTOPS_PASSWORD"))},
 ]
+_crew1_pw = os.environ.get("SEED_CREW1_PASSWORD")
+if _crew1_pw:
+    user_rows.append({"id": uid(), "email": "crew1@iraqiairways.iq", "name_ar": "سارة أحمد الجابري", "name_en": "Sara Ahmed Al-Jaberi", "role": "crew", "is_superuser": False, "hashed_password": hash_pw(_crew1_pw), "crew_id": cr1})
+_crew2_pw = os.environ.get("SEED_CREW2_PASSWORD")
+if _crew2_pw:
+    user_rows.append({"id": uid(), "email": "crew2@iraqiairways.iq", "name_ar": "محمد علي الخزاعي", "name_en": "Mohammed Ali Al-Khazaei", "role": "crew", "is_superuser": False, "hashed_password": hash_pw(_crew2_pw), "crew_id": cr2})
 for u in user_rows:
     u["company_id"] = company_id
     u["is_active"] = True
     u["created_at"] = now
     u["updated_at"] = now
 sb.table("users").insert(user_rows).execute()
-print("[OK] Users: 7 accounts created")
+print(f"[OK] Users: {len(user_rows)} accounts created")
 
 # ── Documents ────────────────────────────────────────────────────────────
 today = date.today()
@@ -97,14 +146,9 @@ print("[OK] Flights: 3 flights created")
 
 print()
 print("=" * 50)
-print("Seeding complete! Login credentials:")
-print("  admin@iraqiairways.iq       / admin123")
-print("  supervisor@iraqiairways.iq  / super123")
-print("  scheduler@iraqiairways.iq   / sched123")
-print("  compliance@iraqiairways.iq  / comp123")
-print("  flights@iraqiairways.iq     / flights123")
-print("  crew1@iraqiairways.iq       / crew123")
-print("  crew2@iraqiairways.iq       / crew456")
+print("Seeding complete! Accounts were created with the passwords you supplied")
+print("via the SEED_* environment variables — they are NOT printed here.")
+print("Log in with the emails above and the password you set for each role.")
 print()
 print("API Docs: http://localhost:8000/api/docs")
 print("=" * 50)

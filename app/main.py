@@ -9,6 +9,12 @@ from slowapi.errors import RateLimitExceeded
 import os
 from pathlib import Path
 
+# Install JSON-formatted logging BEFORE any other logger captures its handler.
+# Uvicorn caches its formatter at import time; calling this first guarantees
+# every log line (ours + uvicorn's) emits the same shape.
+from app.core.logging_setup import setup_json_logging
+setup_json_logging()
+
 logger = logging.getLogger(__name__)
 
 from app.core.config import settings
@@ -16,6 +22,9 @@ from app.core.exceptions import IACMException
 from app.core.rate_limit import limiter
 from app.api.v1.router import api_router
 from app.websockets.manager import ws_manager
+from app.middleware.metrics_middleware import MetricsMiddleware
+from app.services.metrics_service import MetricsCollector
+from app.services.metrics_rollup_service import MetricsRollupService
 
 
 @asynccontextmanager
@@ -27,7 +36,8 @@ async def lifespan(app: FastAPI):
     except OSError:
         pass
 
-    # Test Supabase connection
+    # Test Supabase connection + start the metrics collector flusher.
+    sb = None
     try:
         from app.db.supabase_client import get_supabase
         sb = get_supabase()
@@ -36,7 +46,29 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("Supabase connection failed: %s", e)
 
+    # Observability metrics — start the background flusher + rollup worker.
+    # Both are wrapped so a metrics outage never blocks app startup.
+    if sb is not None:
+        try:
+            await MetricsCollector.instance().start(sb)
+        except Exception as e:
+            logger.warning("MetricsCollector startup failed (non-fatal): %s", e)
+        try:
+            await MetricsRollupService.instance().start(sb)
+        except Exception as e:
+            logger.warning("MetricsRollupService startup failed (non-fatal): %s", e)
+
     yield
+
+    # Drain remaining metrics on shutdown so we don't lose the tail.
+    try:
+        await MetricsCollector.instance().stop()
+    except Exception:
+        pass
+    try:
+        await MetricsRollupService.instance().stop()
+    except Exception:
+        pass
 
 
 app = FastAPI(
@@ -53,13 +85,21 @@ app = FastAPI(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# Observability — must be added FIRST so it sees the request's full lifecycle
+# (including time spent in every middleware below it).
+app.add_middleware(MetricsMiddleware)
+
 # CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.ALLOWED_HOSTS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "Accept", "X-Company-ID"],
+    allow_headers=[
+        "Authorization", "Content-Type", "Accept", "X-Company-ID",
+        # Client version-gating headers (sent by the app on every request).
+        "X-App-Version", "X-App-Platform",
+    ],
 )
 
 

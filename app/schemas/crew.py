@@ -9,6 +9,7 @@ class CrewBase(BaseModel):
     full_name_ar: str
     full_name_en: str
     nickname: Optional[str] = None
+    roster_name: Optional[str] = None
     base: str
     rank: str
     operation_type: str = "short_haul"
@@ -32,6 +33,7 @@ class CrewUpdate(BaseModel):
     full_name_ar: Optional[str] = None
     full_name_en: Optional[str] = None
     nickname: Optional[str] = None
+    roster_name: Optional[str] = None
     base: Optional[str] = None
     rank: Optional[str] = None
     operation_type: Optional[str] = None
@@ -53,6 +55,7 @@ class CrewResponse(BaseResponse):
     full_name_ar: str
     full_name_en: str
     nickname: Optional[str] = None
+    roster_name: Optional[str] = None
     company_id: str
     base: str
     rank: str

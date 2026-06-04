@@ -1,5 +1,8 @@
 from fastapi import APIRouter
 from app.api.v1.endpoints import (
+    app_meta,
+    monthly_hours,
+    companies,
     auth,
     crew,
     flights,
@@ -20,10 +23,20 @@ from app.api.v1.endpoints import (
     irops,
     bidding,
     intelligence,
+    ai_scheduling,
+    standby,
+    admin_metrics,
+    admin_control,
+    developer,
+    developer_actions,
+    developer_vercel,
 )
 
 api_router = APIRouter()
 
+api_router.include_router(app_meta.router)
+api_router.include_router(monthly_hours.router)
+api_router.include_router(companies.router)
 api_router.include_router(auth.router)
 api_router.include_router(crew.router)
 api_router.include_router(flights.router)
@@ -44,3 +57,10 @@ api_router.include_router(safety.router)
 api_router.include_router(irops.router)
 api_router.include_router(bidding.router)
 api_router.include_router(intelligence.router)
+api_router.include_router(ai_scheduling.router)
+api_router.include_router(standby.router)
+api_router.include_router(admin_metrics.router)
+api_router.include_router(admin_control.router)
+api_router.include_router(developer.router)
+api_router.include_router(developer_actions.router)
+api_router.include_router(developer_vercel.router)

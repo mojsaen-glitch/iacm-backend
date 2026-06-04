@@ -18,12 +18,14 @@ class Settings(BaseSettings):
     DEBUG: bool = False
     SECRET_KEY: str
     API_V1_PREFIX: str = "/api/v1"
+    # CORS allowlist (NOT "*"). Kept in code so it's set reliably without the
+    # fragility of JSON-in-an-env-var. An ALLOWED_HOSTS env var (valid JSON
+    # array) still overrides this if present.
     ALLOWED_HOSTS: List[str] = [
+        "https://iacm-frontend.vercel.app",
         "http://localhost:3000",
-        "http://localhost:8080",
         "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "https://backend-jet-nine-75.vercel.app",
+        "http://localhost:8080",
     ]
 
     # Supabase (required)
@@ -62,12 +64,26 @@ class Settings(BaseSettings):
     MAX_YEARLY_HOURS: float = 900.0
     MIN_REST_HOURS: float = 10.0
     MAX_DUTY_HOURS: float = 14.0
+    # Max same-station ground stop still treated as an intra-duty turnaround
+    # (not inter-duty rest). Sectors of a same-day rotation connected by a stop
+    # at/below this many hours form ONE duty; rest applies only after the last.
+    MAX_TURNAROUND_HOURS: float = 3.0
 
     @field_validator("ALLOWED_HOSTS", mode="before")
     @classmethod
     def parse_allowed_hosts(cls, v):
+        # Accept a JSON array OR a comma-separated string, and NEVER raise — a
+        # malformed value must not crash the whole app at startup. Falls back to
+        # comma-splitting, then to an empty list.
         if isinstance(v, str):
-            return json.loads(v)
+            s = v.strip()
+            if not s:
+                return []
+            try:
+                parsed = json.loads(s)
+                return parsed if isinstance(parsed, list) else [str(parsed)]
+            except Exception:
+                return [x.strip() for x in s.split(",") if x.strip()]
         return v
 
 

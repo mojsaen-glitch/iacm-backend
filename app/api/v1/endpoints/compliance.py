@@ -10,11 +10,16 @@ Routes:
   POST /compliance/check-crew/{crew_id}     — same as GET /status (POST convenience)
 """
 
-from datetime import datetime
+import logging
+from datetime import datetime, date, timezone
 from typing import Optional
 from fastapi import APIRouter, Query
 from app.api.deps import SbClient, CurrentUser, OpsManager
-from app.core.compliance_engine import ComplianceEngine, IRAQI_AIRPORTS
+from app.core.compliance_engine import (
+    ComplianceEngine, ComplianceStatus, Severity, IRAQI_AIRPORTS,
+)
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/compliance", tags=["Compliance"])
 
@@ -70,6 +75,87 @@ def _ensure_compliance_reader(user: dict) -> None:
     if user.get("role") not in _COMPLIANCE_READERS:
         from app.core.exceptions import ForbiddenError
         raise ForbiddenError("غير مصرح بإجراء فحص الامتثال")
+
+
+# ─────────────────────────────────────────────────────────────
+# GET /compliance/crew/{crew_id}/legality
+# ─────────────────────────────────────────────────────────────
+@router.get("/crew/{crew_id}/legality")
+async def get_crew_legality(
+    crew_id: str,
+    current_user: CurrentUser,
+    sb: SbClient,
+    reference_time: Optional[str] = Query(None, description="ISO-8601 UTC; default = now"),
+    window_start:   Optional[str] = Query(None, description="ISO-8601 UTC window start"),
+    window_end:     Optional[str] = Query(None, description="ISO-8601 UTC window end"),
+):
+    """Live legality snapshot for the OCC countdown card — remaining FDP / duty /
+    flight-time, minimum rest, next legal report time, and overall status.
+    Read-only; computes against current assignments + FDP/rest/FTL rules."""
+    _ensure_compliance_reader(current_user)
+    from app.core.exceptions import NotFoundError
+    crew_check = sb.table("crew").select("id").eq("id", crew_id)\
+        .eq("company_id", current_user["company_id"]).execute()
+    if not crew_check.data:
+        raise NotFoundError("Crew member", crew_id)
+    engine = ComplianceEngine(sb)
+    return engine.crew_legality(
+        crew_id,
+        reference_time=_parse_dt(reference_time),
+        window_start=_parse_dt(window_start),
+        window_end=_parse_dt(window_end),
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# GET /compliance/fdp-today  — roster-wide FDP board for the day
+# ─────────────────────────────────────────────────────────────
+@router.get("/fdp-today")
+async def fdp_today(
+    current_user: CurrentUser,
+    sb: SbClient,
+    date_str: Optional[str] = Query(None, alias="date"),
+):
+    """Every crew scheduled on the target Baghdad day with a compact FDP verdict
+    (sectors, FDP used/remaining, previous rest, status). Worst status first."""
+    _ensure_compliance_reader(current_user)
+    on_date = None
+    if date_str:
+        try:
+            on_date = date.fromisoformat(date_str)
+        except (ValueError, TypeError):
+            on_date = None
+    rows = ComplianceEngine(sb).fdp_monitor_today(current_user["company_id"], on_date=on_date)
+    return {"date": (on_date.isoformat() if on_date else None), "crew": rows, "count": len(rows)}
+
+
+# ─────────────────────────────────────────────────────────────
+# GET /compliance/fdp-monitor/{crew_id}
+# ─────────────────────────────────────────────────────────────
+@router.get("/fdp-monitor/{crew_id}")
+async def fdp_monitor(
+    crew_id: str,
+    current_user: CurrentUser,
+    sb: SbClient,
+    date_str: Optional[str] = Query(None, alias="date",
+                                    description="Baghdad-local day YYYY-MM-DD; default = today's/active duty"),
+):
+    """Schedule-linked FDP snapshot for one crew: their flights for the target
+    day, report time, sectors, final arrival, FDP used/max/remaining, previous
+    rest and the compliance verdict. All times UTC (UI renders Baghdad=UTC+3)."""
+    _ensure_compliance_reader(current_user)
+    from app.core.exceptions import NotFoundError
+    crew_check = sb.table("crew").select("id").eq("id", crew_id) \
+        .eq("company_id", current_user["company_id"]).execute()
+    if not crew_check.data:
+        raise NotFoundError("Crew member", crew_id)
+    on_date = None
+    if date_str:
+        try:
+            on_date = date.fromisoformat(date_str)
+        except (ValueError, TypeError):
+            on_date = None
+    return ComplianceEngine(sb).fdp_monitor(crew_id, on_date=on_date)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -142,6 +228,7 @@ async def check_assignment_compliance(
         flight_departure=dep,
         flight_arrival=arr,
         is_international=intl,
+        flight_aircraft_type=flight.get("aircraft_type"),
     )
 
     # Attach flight info for convenience
@@ -173,6 +260,8 @@ async def get_blocked_crew(
     Warning: runs a check per crew member — may be slow for large crews.
     Use for dashboard/reporting only, not per-request checks.
     """
+    # A total DB failure here SHOULD surface as 500 — we can't reason about
+    # compliance with no crew list. Per-crew failures below are isolated.
     crew_res = sb.table("crew") \
         .select("id,full_name_ar,full_name_en,employee_id,rank,status") \
         .eq("company_id", current_user["company_id"]) \
@@ -183,7 +272,45 @@ async def get_blocked_crew(
     results = []
 
     for crew in crew_list:
-        result = engine.check_crew(crew["id"])
+        cid     = crew.get("id")
+        name_ar = crew.get("full_name_ar", "")
+        try:
+            result = engine.check_crew(cid)
+        except Exception as exc:
+            # Fail-closed but ISOLATED: a bad record (missing data / invalid
+            # time) must not 500 the whole board. Surface this crew member as
+            # BLOCKED with a clear reason and keep checking the rest.
+            logger.exception(
+                "blocked-crew: compliance check failed for crew_id=%s name=%s",
+                cid, name_ar,
+            )
+            _msg_ar = "تعذر فحص الامتثال لهذا الطاقم بسبب بيانات ناقصة أو وقت غير صالح"
+            _msg_en = ("Could not run compliance check for this crew member "
+                       "due to missing data or an invalid time")
+            result = {
+                "crew_id":          cid,
+                "crew_name_ar":     name_ar,
+                "crew_name_en":     crew.get("full_name_en", ""),
+                "employee_id":      crew.get("employee_id", ""),
+                "rank":             crew.get("rank", ""),
+                "status":           ComplianceStatus.BLOCKED,
+                "issues":           [{
+                    "rule":        "compliance_check_error",
+                    "severity":    Severity.BLOCKING,
+                    "message_ar":  _msg_ar,
+                    "message_en":  _msg_en,
+                    "is_blocking": True,
+                    "detail":      {"error": str(exc)},
+                    "om_ref":      None,
+                }],
+                "blocking_count":   1,
+                "critical_count":   0,
+                "warning_count":    0,
+                "info_count":       0,
+                "blocking_reasons": [_msg_ar],
+                "checked_at":       datetime.now(timezone.utc).isoformat(),
+            }
+
         comp_status = result.get("status", "GREEN")
 
         # Apply optional filter

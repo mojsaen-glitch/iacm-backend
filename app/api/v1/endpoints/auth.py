@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Request
 from datetime import datetime, timezone
 from typing import List
+from pydantic import BaseModel
 from app.api.deps import SbClient, CurrentUser, AdminOnly
 from app.schemas.auth import (
     LoginRequest, TokenResponse, RefreshTokenRequest,
@@ -11,13 +12,33 @@ from app.core.security import verify_password, get_password_hash, create_access_
 from app.core.exceptions import UnauthorizedError, ForbiddenError
 from app.core.config import settings
 from app.core.rate_limit import limiter
+from app.core.departments import is_global_admin, managed_roles_for
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
+
+
+def _ensure_user_manager(current_user: dict) -> set | None:
+    """Authorize user-management actions.
+
+    Returns None for global admins (may manage ANY role), or the set of roles a
+    department admin may manage. Raises ForbiddenError if neither.
+    """
+    role = current_user.get("role")
+    if is_global_admin(role):
+        return None
+    managed = managed_roles_for(role)
+    if managed is None:
+        raise ForbiddenError("Admin access required")
+    return managed
 
 
 @router.post("/login", response_model=TokenResponse)
 @limiter.limit("5/minute")
 async def login(request: Request, data: LoginRequest, sb: SbClient):
+    """Password login. If 2FA is enabled for the account, the response is
+    `{requires_2fa: true, challenge_token: ...}` (HTTP 200, NO access token);
+    the client must follow up with POST /auth/2fa/login carrying the
+    challenge_token + the 6-digit code."""
     result = sb.table("users").select("*").eq("email", data.email).eq("is_active", True).execute()
     users = result.data
     if not users:
@@ -25,6 +46,23 @@ async def login(request: Request, data: LoginRequest, sb: SbClient):
     user = users[0]
     if not verify_password(data.password, user["hashed_password"]):
         raise UnauthorizedError("Invalid email or password")
+
+    # 2FA gate — if enrolled, return a short-lived challenge token instead
+    # of the real access token. The actual access token is minted only
+    # after the user posts a valid code to /auth/2fa/login.
+    if user.get("totp_enabled"):
+        challenge = create_access_token(
+            subject=user["id"],
+            extra_claims={"purpose": "2fa_challenge"},
+            expires_minutes=5,
+        )
+        # NOTE: returned as a plain dict (not TokenResponse) so the client
+        # can branch on `requires_2fa` without crashing on a missing token.
+        from fastapi.responses import JSONResponse
+        return JSONResponse({
+            "requires_2fa":   True,
+            "challenge_token": challenge,
+        })
 
     access_token = create_access_token(subject=user["id"])
     refresh_token = create_refresh_token(subject=user["id"])
@@ -39,6 +77,105 @@ async def login(request: Request, data: LoginRequest, sb: SbClient):
         refresh_token=refresh_token,
         expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
     )
+
+
+# ── 2FA TOTP (M2+) ─────────────────────────────────────────────────────
+class _TwoFactorLoginRequest(BaseModel):
+    challenge_token: str
+    code:            str
+
+
+@router.post("/2fa/login", response_model=TokenResponse)
+@limiter.limit("10/minute")
+async def login_2fa(request: Request, data: _TwoFactorLoginRequest, sb: SbClient):
+    """Second step of 2FA login — exchange (challenge_token + code) for an
+    access+refresh pair. The challenge token expires after 5 minutes."""
+    payload = decode_token(data.challenge_token)
+    if not payload or payload.get("purpose") != "2fa_challenge":
+        raise UnauthorizedError("Invalid or expired challenge")
+    user_id = payload.get("sub")
+    if not user_id:
+        raise UnauthorizedError("Invalid challenge token")
+    res = sb.table("users").select("*").eq("id", user_id) \
+        .eq("is_active", True).execute()
+    if not res.data:
+        raise UnauthorizedError("User not found")
+    user = res.data[0]
+    secret = user.get("totp_secret")
+    if not secret or not user.get("totp_enabled"):
+        raise UnauthorizedError("2FA is not enabled for this account")
+    import pyotp
+    if not pyotp.TOTP(secret).verify(data.code.strip(), valid_window=1):
+        raise UnauthorizedError("Invalid 2FA code")
+    access_token  = create_access_token(subject=user["id"])
+    refresh_token = create_refresh_token(subject=user["id"])
+    sb.table("users").update({
+        "refresh_token": refresh_token,
+        "last_login":    datetime.now(timezone.utc).isoformat(),
+    }).eq("id", user["id"]).execute()
+    return TokenResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+    )
+
+
+@router.post("/2fa/enroll")
+async def enroll_2fa(current_user: CurrentUser, sb: SbClient):
+    """Begin 2FA enrolment — generates + persists a TOTP secret and returns
+    the otpauth:// URI the client renders as a QR code. The user must then
+    verify a code via /auth/2fa/verify to flip `totp_enabled=true`."""
+    import pyotp
+    secret = pyotp.random_base32()
+    sb.table("users").update({
+        "totp_secret":  secret,
+        "totp_enabled": False,    # not active until verified
+    }).eq("id", current_user["id"]).execute()
+    email = current_user.get("email") or "user"
+    issuer = "IACM Admin"
+    uri = pyotp.TOTP(secret).provisioning_uri(name=email, issuer_name=issuer)
+    return {"secret": secret, "otpauth_uri": uri, "issuer": issuer}
+
+
+class _Verify2FARequest(BaseModel):
+    code: str
+
+
+@router.post("/2fa/verify")
+async def verify_2fa(data: _Verify2FARequest, current_user: CurrentUser, sb: SbClient):
+    """Finish enrolment — verify that the scanned secret produces a valid
+    code. On success, flip totp_enabled=true."""
+    res = sb.table("users").select("totp_secret").eq("id", current_user["id"]).execute()
+    if not res.data or not res.data[0].get("totp_secret"):
+        raise HTTPException(status_code=400, detail="ابدأ التسجيل أولاً عبر /auth/2fa/enroll")
+    secret = res.data[0]["totp_secret"]
+    import pyotp
+    if not pyotp.TOTP(secret).verify(data.code.strip(), valid_window=1):
+        raise UnauthorizedError("Invalid 2FA code")
+    sb.table("users").update({
+        "totp_enabled":     True,
+        "totp_enrolled_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", current_user["id"]).execute()
+    return {"ok": True, "totp_enabled": True}
+
+
+@router.post("/2fa/disable")
+async def disable_2fa(data: _Verify2FARequest, current_user: CurrentUser, sb: SbClient):
+    """Disable 2FA — requires a valid current code so a stolen JWT alone
+    can't turn it off."""
+    res = sb.table("users").select("totp_secret,totp_enabled") \
+        .eq("id", current_user["id"]).execute()
+    if not res.data or not res.data[0].get("totp_enabled"):
+        return {"ok": True, "totp_enabled": False}
+    secret = res.data[0]["totp_secret"]
+    import pyotp
+    if not pyotp.TOTP(secret).verify(data.code.strip(), valid_window=1):
+        raise UnauthorizedError("Invalid 2FA code")
+    sb.table("users").update({
+        "totp_secret":  None,
+        "totp_enabled": False,
+    }).eq("id", current_user["id"]).execute()
+    return {"ok": True, "totp_enabled": False}
 
 
 @router.post("/refresh", response_model=TokenResponse)
@@ -112,9 +249,9 @@ async def get_me(current_user: CurrentUser):
 
 @router.get("/users", response_model=List[UserListItem])
 async def list_users(current_user: CurrentUser, sb: SbClient):
-    """List all users in the same company. Admin/super_admin only."""
-    if current_user["role"] not in ("super_admin", "admin"):
-        raise ForbiddenError("Admin access required")
+    """List users in the same company. Global admins see everyone; a department
+    admin sees only the staff whose role belongs to their department."""
+    managed = _ensure_user_manager(current_user)
 
     result = sb.table("users") \
         .select("id,email,name_ar,name_en,role,is_active,company_id,last_login") \
@@ -122,14 +259,19 @@ async def list_users(current_user: CurrentUser, sb: SbClient):
         .order("name_ar") \
         .execute()
 
-    return [UserListItem(**u) for u in result.data]
+    rows = result.data or []
+    if managed is not None:
+        rows = [u for u in rows if u.get("role") in managed]
+    return [UserListItem(**u) for u in rows]
 
 
 @router.post("/users", response_model=UserListItem, status_code=201)
 async def create_user(data: CreateUserRequest, current_user: CurrentUser, sb: SbClient):
-    """Create a new system user. Admin/super_admin only."""
-    if current_user["role"] not in ("super_admin", "admin"):
-        raise ForbiddenError("Admin access required")
+    """Create a new system user. Global admins create any role; a department
+    admin may only create staff within their own department."""
+    managed = _ensure_user_manager(current_user)
+    if managed is not None and data.role not in managed:
+        raise ForbiddenError("لا يمكنك إنشاء حساب بدور خارج شعبتك")
 
     # Check email uniqueness
     existing = sb.table("users").select("id").eq("email", data.email).execute()
@@ -177,9 +319,9 @@ async def create_user(data: CreateUserRequest, current_user: CurrentUser, sb: Sb
 
 @router.patch("/users/{user_id}/role", response_model=UserListItem)
 async def update_user_role(user_id: str, data: dict, current_user: CurrentUser, sb: SbClient):
-    """Change a user's role. Admin only. Cannot demote yourself."""
-    if current_user["role"] not in ("super_admin", "admin"):
-        raise ForbiddenError("Admin access required")
+    """Change a user's role. Cannot demote yourself. Department admins may only
+    move staff between roles WITHIN their own department."""
+    managed = _ensure_user_manager(current_user)
     if user_id == current_user["id"]:
         raise HTTPException(status_code=400, detail="لا يمكنك تعديل دور حسابك الخاص")
 
@@ -196,6 +338,13 @@ async def update_user_role(user_id: str, data: dict, current_user: CurrentUser, 
     if not existing.data:
         raise HTTPException(status_code=404, detail="المستخدم غير موجود")
 
+    # Department admins: both the target's current role and the new role must
+    # be inside their department.
+    if managed is not None and (
+        existing.data[0].get("role") not in managed or new_role not in managed
+    ):
+        raise ForbiddenError("لا يمكنك تعديل دور خارج شعبتك")
+
     updated = sb.table("users").update({"role": new_role}).eq("id", user_id).execute()
     u = updated.data[0]
     return UserListItem(
@@ -207,9 +356,8 @@ async def update_user_role(user_id: str, data: dict, current_user: CurrentUser, 
 
 @router.patch("/users/{user_id}/toggle", response_model=UserListItem)
 async def toggle_user_active(user_id: str, current_user: CurrentUser, sb: SbClient):
-    """Activate or deactivate a user. Admin only."""
-    if current_user["role"] not in ("super_admin", "admin"):
-        raise ForbiddenError("Admin access required")
+    """Activate or deactivate a user. Department admins only within their dept."""
+    managed = _ensure_user_manager(current_user)
 
     # Cannot deactivate self
     if user_id == current_user["id"]:
@@ -221,6 +369,8 @@ async def toggle_user_active(user_id: str, current_user: CurrentUser, sb: SbClie
         raise HTTPException(status_code=404, detail="المستخدم غير موجود")
 
     user = result.data[0]
+    if managed is not None and user.get("role") not in managed:
+        raise ForbiddenError("لا يمكنك تعطيل مستخدم خارج شعبتك")
     new_status = not user["is_active"]
     updated = sb.table("users").update({"is_active": new_status}).eq("id", user_id).execute()
     u = updated.data[0]
@@ -238,17 +388,18 @@ async def reset_user_password(request: Request, user_id: str, data: dict, curren
     """Admin resets another user's password. The temp password is shown ONCE in the
     response so the admin can communicate it through a secure channel (do NOT log it).
     Refresh tokens are invalidated to force re-login."""
-    if current_user["role"] not in ("super_admin", "admin"):
-        raise ForbiddenError("Admin access required")
+    managed = _ensure_user_manager(current_user)
 
     # Admin cannot reset their own password through this endpoint (use /change-password)
     if user_id == current_user["id"]:
         raise HTTPException(status_code=400, detail="استخدم تغيير كلمة المرور لحسابك الخاص")
 
-    result = sb.table("users").select("id,email,name_ar,name_en").eq("id", user_id)\
+    result = sb.table("users").select("id,email,name_ar,name_en,role").eq("id", user_id)\
         .eq("company_id", current_user["company_id"]).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="المستخدم غير موجود")
+    if managed is not None and result.data[0].get("role") not in managed:
+        raise ForbiddenError("لا يمكنك إعادة تعيين كلمة مرور مستخدم خارج شعبتك")
 
     new_password = (data.get("new_password") or "").strip()
     if not new_password:

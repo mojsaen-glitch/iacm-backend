@@ -1,5 +1,7 @@
 .env
 .env.local
+.env.bak
+*.bak
 
 # Firebase Admin SDK — NEVER commit these
 secrets/

@@ -41,7 +41,8 @@ class FTLViolationError(IACMException):
 class CrewBlockedError(IACMException):
     """Crew member is blocked and cannot be assigned"""
     def __init__(self, crew_name: str, reason: str = None):
-        detail = f"Crew member '{crew_name}' is blocked"
+        # Arabic, operator-facing message (the UI shows `detail` verbatim).
+        detail = f"تعذّر تكليف «{crew_name}» — مخالفة لقواعد الطيران"
         if reason:
             detail += f": {reason}"
         super().__init__(status.HTTP_409_CONFLICT, detail, "CREW_BLOCKED")

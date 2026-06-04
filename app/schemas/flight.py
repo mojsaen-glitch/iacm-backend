@@ -11,6 +11,7 @@ class FlightBase(BaseModel):
     departure_time: datetime
     arrival_time: datetime
     crew_required: int = 4
+    standby_required: int = 0
     notes: Optional[str] = None
     gate: Optional[str] = None
 
@@ -33,6 +34,7 @@ class FlightUpdate(BaseModel):
     departure_time: Optional[datetime] = None
     arrival_time: Optional[datetime] = None
     crew_required: Optional[int] = None
+    standby_required: Optional[int] = None
     status: Optional[str] = None
     publish_status: Optional[str] = None
     delay_minutes: Optional[int] = None
@@ -53,6 +55,7 @@ class FlightResponse(BaseResponse):
     arrival_time: datetime
     duration_hours: float
     crew_required: int
+    standby_required: int = 0
     status: str
     publish_status: str
     delay_minutes: int
