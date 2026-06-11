@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import uuid, math
 from typing import Optional
 from datetime import datetime, timezone, timedelta
@@ -41,6 +42,29 @@ _PUBLISH_TOGGLERS = _FLIGHT_EDITORS | {
 def _ensure_publisher(user: dict) -> None:
     if user.get("role") not in _PUBLISH_TOGGLERS:
         raise ForbiddenError("غير مصرح بنشر أو إلغاء نشر الرحلات")
+
+
+# ── Aircraft registration (REG / tail number) ────────────────────────────────
+# REG is the aircraft tail (e.g. YI-ASU) — NOT the flight number (IA-361) and NOT
+# the aircraft type (A320). It is MANDATORY: a flight cannot be created, nor can
+# its roster be published / finalised, without a valid REG, because the official
+# General Declaration (GD) prints it as the aircraft's identity for that flight.
+# Format requires a dashed nationality prefix (e.g. YI-ASU, G-ABCD) so an
+# aircraft TYPE (A320 / B737 — no dash) can never be mistaken for a tail. Lenient
+# on the country prefix to allow foreign / charter tails; Iraqi tails are YI-*.
+_REG_RE = re.compile(r"^[A-Z]{1,2}-[A-Z0-9]{2,5}$")
+
+
+def _normalize_reg(value) -> str:
+    return str(value or "").strip().upper()
+
+
+def _validate_reg_format(reg: str) -> None:
+    if not _REG_RE.match(reg):
+        raise HTTPException(
+            status_code=422,
+            detail="صيغة رقم تسجيل الطائرة (REG) غير صحيحة — مثال: YI-ASU",
+        )
 
 
 # ── Automatic time-based status lifecycle ────────────────────────────────────
@@ -172,6 +196,10 @@ async def list_flights(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=500),
     status: Optional[str] = None,
+    from_dt: Optional[str] = Query(None, alias="from",
+        description="ISO datetime — only flights departing at/after this"),
+    to_dt: Optional[str] = Query(None, alias="to",
+        description="ISO datetime — only flights departing before this"),
 ):
     # Lazily advance time-due flight statuses (+ notify crew) before listing,
     # but at most once per company per throttle window so frequent polling
@@ -191,6 +219,12 @@ async def list_flights(
     query = sb.table("flights").select("*", count="estimated").eq("company_id", current_user["company_id"])
     if status:
         query = query.eq("status", status)
+    # Optional departure-time window (used by the OCC board to fetch ONLY a given
+    # day's flights server-side, instead of paging through historical rows).
+    if from_dt:
+        query = query.gte("departure_time", from_dt)
+    if to_dt:
+        query = query.lt("departure_time", to_dt)
 
     skip = (page - 1) * page_size
     result = query.order("departure_time", desc=False).range(skip, skip + page_size - 1).execute()
@@ -293,6 +327,16 @@ async def create_flight(data: dict, current_user: CurrentUser, sb: SbClient):
         raise HTTPException(status_code=422, detail=f"Invalid datetime format: {e}")
     duration = round((arr - dep).total_seconds() / 3600, 2)
 
+    # REG (aircraft tail) is mandatory — a flight can't be saved without it.
+    reg = _normalize_reg(data.get("aircraft_registration"))
+    if not reg:
+        raise HTTPException(
+            status_code=422,
+            detail="رقم تسجيل الطائرة (REG) مطلوب — لا يمكن حفظ الرحلة بدونه.",
+        )
+    _validate_reg_format(reg)
+    data["aircraft_registration"] = reg
+
     data["id"] = str(uuid.uuid4())
     data["company_id"] = current_user["company_id"]
     data["duration_hours"] = duration
@@ -350,6 +394,19 @@ async def update_flight(flight_id: str, data: dict, current_user: CurrentUser, s
     existing = sb.table("flights").select("id").eq("id", flight_id).eq("company_id", current_user["company_id"]).execute()
     if not existing.data:
         raise NotFoundError("Flight", flight_id)
+
+    # REG can be set/corrected here (movement / ops edit + tail swap). When the
+    # caller includes it, it must be a valid, non-empty tail — REG cannot be
+    # cleared once a flight has one.
+    if "aircraft_registration" in data:
+        reg = _normalize_reg(data.get("aircraft_registration"))
+        if not reg:
+            raise HTTPException(
+                status_code=422,
+                detail="رقم تسجيل الطائرة (REG) لا يمكن أن يكون فارغاً.",
+            )
+        _validate_reg_format(reg)
+        data["aircraft_registration"] = reg
 
     if "departure_time" in data or "arrival_time" in data:
         flight = sb.table("flights").select("departure_time,arrival_time").eq("id", flight_id).execute().data[0]
@@ -456,6 +513,14 @@ async def publish_flight(flight_id: str, current_user: CurrentUser, sb: SbClient
     if flight.get("publish_status") == "published":
         return flight  # already published
 
+    # REG gate: a flight cannot be published without an aircraft registration —
+    # the GD (and the crew's official duty document) require the tail number.
+    if not _normalize_reg(flight.get("aircraft_registration")):
+        raise HTTPException(
+            status_code=422,
+            detail="لا يمكن نشر الرحلة بدون رقم تسجيل الطائرة (REG). أضِف REG أولاً.",
+        )
+
     # NOTE: publishing only OPENS a flight for crew assignment — it may legally
     # have no crew yet. The minimum-crew (under-staffing) gate is enforced later,
     # at roster finalisation (see POST /flights/{id}/finalize-roster).
@@ -465,6 +530,25 @@ async def publish_flight(flight_id: str, current_user: CurrentUser, sb: SbClient
         "publish_status": "published",
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", flight_id).execute()
+
+    # ── Audit: publishing notifies a whole crew — first-class governance event. ──
+    try:
+        sb.table("audit_log").insert({
+            "user_id": current_user["id"],
+            "user_name": current_user.get("name_ar") or current_user.get("name_en")
+                         or current_user.get("email", ""),
+            "action": "publish_flight", "entity_type": "flight", "entity_id": flight_id,
+            "company_id": current_user["company_id"],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "before_data": json.dumps(
+                {"publish_status": flight.get("publish_status") or "draft"}),
+            "after_data": json.dumps({
+                "publish_status": "published",
+                "flight_number": flight.get("flight_number"),
+            }, ensure_ascii=False),
+        }).execute()
+    except Exception as e:
+        log.warning("audit_log write failed for publish_flight: %s", e)
 
     # Notify all allocators (cabin + cockpit + ground + crew_allocator)
     allocator_roles = [
@@ -541,9 +625,13 @@ async def publish_flight(flight_id: str, current_user: CurrentUser, sb: SbClient
 @router.post("/{flight_id}/unpublish")
 async def unpublish_flight(flight_id: str, current_user: CurrentUser, sb: SbClient):
     """Revert a published flight back to draft so its roster can be edited again
-    (pulls it out of the assignable pool). Same scheduling gate as publishing;
-    idempotent if the flight is already a draft."""
-    _ensure_publisher(current_user)
+    (pulls it out of the assignable pool). Idempotent if already a draft.
+
+    SUPERVISORY gate (tighter than publish): un-publishing HIDES the flight
+    from crew who were already notified, so specialty schedulers (sched_*) may
+    publish but only scheduling/ops supervisors may revert."""
+    if current_user.get("role") not in _ROSTER_APPROVERS and not current_user.get("is_superuser"):
+        raise ForbiddenError("إلغاء النشر إجراء إشرافي — مدير الجدولة/العمليات فقط")
     flight_res = sb.table("flights").select("*") \
         .eq("id", flight_id).eq("company_id", current_user["company_id"]).execute()
     if not flight_res.data:
@@ -553,10 +641,64 @@ async def unpublish_flight(flight_id: str, current_user: CurrentUser, sb: SbClie
     if flight.get("publish_status") != "published":
         return flight  # already a draft — nothing to do
 
+    now_iso = datetime.now(timezone.utc).isoformat()
     updated = sb.table("flights").update({
         "publish_status": "draft",
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": now_iso,
     }).eq("id", flight_id).execute()
+
+    fnum = flight.get("flight_number", "")
+    origin = flight.get("origin_code", "")
+    dest = flight.get("destination_code", "")
+
+    # ── Audit: un-publishing HIDES a flight crew were already notified about. ──
+    try:
+        sb.table("audit_log").insert({
+            "user_id": current_user["id"],
+            "user_name": current_user.get("name_ar") or current_user.get("name_en")
+                         or current_user.get("email", ""),
+            "action": "unpublish_flight", "entity_type": "flight", "entity_id": flight_id,
+            "company_id": current_user["company_id"], "created_at": now_iso,
+            "before_data": json.dumps({"publish_status": "published"}),
+            "after_data": json.dumps({
+                "publish_status": "draft", "flight_number": fnum,
+            }, ensure_ascii=False),
+        }).execute()
+    except Exception as e:
+        log.warning("audit_log write failed for unpublish_flight: %s", e)
+
+    # ── Notify the ASSIGNED crew — the flight disappears from their portal, so
+    #    it must never vanish silently. Assignments are NOT touched. ──
+    try:
+        asg = (sb.table("assignments").select("crew_id")
+               .eq("flight_id", flight_id).execute().data) or []
+        crew_ids = [a["crew_id"] for a in asg if a.get("crew_id")]
+        if crew_ids:
+            urows = (sb.table("users").select("id,crew_id")
+                     .eq("company_id", current_user["company_id"])
+                     .in_("crew_id", crew_ids).execute().data) or []
+            uids = [u["id"] for u in urows if u.get("id")]
+            title_ar = f"سُحب نشر الرحلة {fnum}"
+            msg_ar = (f"تم سحب نشر الرحلة {fnum} ({origin} → {dest}) من بوابة الطاقم، "
+                      f"يرجى مراجعة الجدولة أو انتظار التحديث.")
+            if uids:
+                sb.table("notifications").insert([{
+                    "id": str(uuid.uuid4()), "user_id": uid, "type": "flight_unpublished",
+                    "title_ar": title_ar, "title_en": f"Flight {fnum} unpublished",
+                    "message_ar": msg_ar,
+                    "message_en": f"Flight {fnum} ({origin}→{dest}) was withdrawn from the "
+                                  f"crew portal — await an updated schedule.",
+                    "body_ar": msg_ar, "body_en": f"Flight {fnum} unpublished",
+                    "reference_id": flight_id, "reference_type": "flight",
+                    "related_flight_id": flight_id, "is_read": False, "created_at": now_iso,
+                } for uid in uids]).execute()
+                push_service.send_to_users(sb, uids, title=title_ar, body=msg_ar,
+                                           data={"type": "flight_unpublished",
+                                                 "reference_id": str(flight_id),
+                                                 "reference_type": "flight"})
+    except Exception as e:
+        log.warning("unpublish crew-notify failed: %s", e)
+
     return updated.data[0] if updated.data else flight
 
 
@@ -565,6 +707,200 @@ async def unpublish_flight(flight_id: str, current_user: CurrentUser, sb: SbClie
 _ROSTER_APPROVERS = {
     "super_admin", "admin", "ops_manager", "scheduler", "scheduler_admin",
 }
+
+# Who may view a flight's notification READ-receipts (who read what / when).
+# Scheduling family + allocators + compliance (read) + movement (read). NEVER crew.
+_RECEIPT_VIEWERS = {
+    "super_admin", "admin", "ops_manager", "scheduler", "scheduler_admin",
+    "sched_captain", "sched_copilot", "sched_engineer", "sched_purser",
+    "sched_cabin", "sched_balance", "sched_security", "sched_extra",
+    "crew_allocator", "cabin_allocator", "cockpit_allocator", "ground_allocator",
+    "compliance_officer", "flight_movement", "flight_movement_admin",
+}
+
+
+@router.get("/{flight_id}/assignment-acceptance")
+async def flight_assignment_acceptance(flight_id: str, current_user: CurrentUser, sb: SbClient):
+    """Crew-acceptance board for a flight's roster: who ACCEPTED / is still
+    pending / declined / was admin-confirmed. Distinct from read-receipts —
+    reading a notification is never acceptance. Crew role is never allowed."""
+    if current_user.get("role") not in _RECEIPT_VIEWERS and not current_user.get("is_superuser"):
+        raise ForbiddenError("غير مصرح بعرض حالة موافقات الطاقم")
+    cid = current_user["company_id"]
+
+    fres = sb.table("flights").select(
+        "id, flight_number, origin_code, destination_code, departure_time") \
+        .eq("id", flight_id).eq("company_id", cid).execute()
+    if not fres.data:
+        raise NotFoundError("Flight", flight_id)
+    flight = fres.data[0]
+
+    rows = (sb.table("assignments").select("*")
+            .eq("flight_id", flight_id).execute().data) or []
+    crew_ids = [r.get("crew_id") for r in rows if r.get("crew_id")]
+    names: dict = {}
+    if crew_ids:
+        for c in (sb.table("crew").select("id, full_name_ar, full_name_en, rank")
+                  .in_("id", crew_ids).execute().data) or []:
+            names[c["id"]] = c
+
+    counts = {"accepted": 0, "pending_acceptance": 0, "declined": 0,
+              "admin_confirmed": 0}
+    items = []
+    for r in rows:
+        st = _acceptance_status_of(r)
+        counts[st] = counts.get(st, 0) + 1
+        c = names.get(r.get("crew_id"), {})
+        items.append({
+            "assignment_id": r.get("id"),
+            "crew_id": r.get("crew_id"),
+            "crew_name": c.get("full_name_ar") or c.get("full_name_en") or "—",
+            "crew_role": r.get("assigned_role") or c.get("rank") or "",
+            "duty_type": r.get("duty_type") or "operating",
+            "acceptance_status": st,
+            "assigned_at": r.get("created_at"),
+            "accepted_at": r.get("acknowledged_at") if r.get("acknowledged") else None,
+            "declined_at": r.get("declined_at"),
+            "response_note": r.get("decline_reason"),
+            "admin_confirmed_by": r.get("admin_confirmed_by"),
+            "admin_confirmed_at": r.get("admin_confirmed_at"),
+            "admin_confirm_reason": r.get("admin_confirm_reason"),
+        })
+    items.sort(key=lambda i: {"declined": 0, "pending_acceptance": 1,
+                              "admin_confirmed": 2, "accepted": 3}
+               .get(i["acceptance_status"], 9))
+
+    total = len(items)
+    ok = counts["accepted"] + counts["admin_confirmed"]
+    return {
+        "flight_id": flight_id,
+        "flight_number": flight.get("flight_number") or "",
+        "route": f"{flight.get('origin_code') or ''}-{flight.get('destination_code') or ''}",
+        "departure_time": flight.get("departure_time"),
+        "summary": {
+            "total": total,
+            "accepted": counts["accepted"],
+            "pending": counts["pending_acceptance"],
+            "declined": counts["declined"],
+            "admin_confirmed": counts["admin_confirmed"],
+            "removed": 0,   # removals delete the row; the trail lives in audit_log
+            "acceptance_percentage": round(ok * 100 / total) if total else 0,
+        },
+        "items": items,
+    }
+
+
+@router.get("/{flight_id}/notification-receipts")
+async def flight_notification_receipts(flight_id: str, current_user: CurrentUser, sb: SbClient):
+    """Read-receipts board for a flight's notifications: who was notified, who
+    READ (is_read/read_at from the notifications table — a push being delivered
+    is NOT counted as read), who hasn't yet. Source of truth = notifications
+    rows linked to this flight, so it covers publish/unpublish/assignment/GD/
+    disruption alike. Company-scoped; crew role is never allowed."""
+    if current_user.get("role") not in _RECEIPT_VIEWERS and not current_user.get("is_superuser"):
+        raise ForbiddenError("غير مصرح بعرض إيصالات إشعارات الرحلة")
+    cid = current_user["company_id"]
+
+    fres = sb.table("flights").select(
+        "id, flight_number, origin_code, destination_code, departure_time,"
+        "publish_status, roster_finalized_status, gd_status") \
+        .eq("id", flight_id).eq("company_id", cid).execute()
+    if not fres.data:
+        raise NotFoundError("Flight", flight_id)
+    flight = fres.data[0]
+
+    # Notifications are linked to a flight via related_flight_id (most writers)
+    # or reference_id (older writers) — merge both, de-duplicated by id.
+    rows: dict[str, dict] = {}
+    for col in ("related_flight_id", "reference_id"):
+        try:
+            for n in (sb.table("notifications").select("*")
+                      .eq(col, flight_id).execute().data) or []:
+                if n.get("id"):
+                    rows[n["id"]] = n
+        except Exception as e:
+            log.warning("receipts query on %s failed: %s", col, e)
+    notifs = sorted(rows.values(), key=lambda n: n.get("created_at") or "", reverse=True)
+
+    # Resolve recipients: user → (role, crew link) → crew (name/rank/phone).
+    user_ids = list({n.get("user_id") for n in notifs if n.get("user_id")})
+    users_by: dict = {}
+    if user_ids:
+        for i in range(0, len(user_ids), 500):
+            for u in (sb.table("users").select("id, crew_id, role, name_ar, name_en")
+                      .in_("id", user_ids[i:i + 500]).execute().data) or []:
+                users_by[u["id"]] = u
+    crew_ids = list({u.get("crew_id") for u in users_by.values() if u.get("crew_id")})
+    crew_by: dict = {}
+    if crew_ids:
+        for c in (sb.table("crew").select(
+                "id, full_name_ar, full_name_en, rank, primary_phone, phone")
+                .in_("id", crew_ids).execute().data) or []:
+            crew_by[c["id"]] = c
+
+    items = []
+    total_read = 0
+    last_read = None
+    for n in notifs:
+        u = users_by.get(n.get("user_id"), {})
+        c = crew_by.get(u.get("crew_id"), {})
+        is_read = bool(n.get("is_read"))
+        if is_read:
+            total_read += 1
+            ra = n.get("read_at")
+            if ra and (last_read is None or ra > last_read):
+                last_read = ra
+        items.append({
+            "notification_id": n.get("id"),
+            "notification_type": n.get("type") or "",
+            "notification_title": n.get("title_ar") or n.get("title_en") or "",
+            "sent_at": n.get("created_at"),
+            "read_at": n.get("read_at"),
+            "is_read": is_read,
+            "status": "read" if is_read else "unread",
+            "user_id": n.get("user_id"),
+            "recipient_kind": "crew" if u.get("crew_id") else "staff",
+            "crew_id": u.get("crew_id"),
+            "crew_name": (c.get("full_name_ar") or c.get("full_name_en")
+                          or u.get("name_ar") or u.get("name_en") or ""),
+            "crew_role": c.get("rank") or u.get("role") or "",
+            "crew_rank": c.get("rank") or "",
+            "crew_phone": c.get("primary_phone") or c.get("phone") or "",
+        })
+
+    total = len(items)
+    # Best-effort audit — a supervisor viewing read-receipts is itself auditable.
+    try:
+        sb.table("audit_log").insert({
+            "user_id": current_user["id"],
+            "user_name": current_user.get("name_ar") or current_user.get("name_en")
+                         or current_user.get("email", ""),
+            "action": "view_flight_notification_receipts",
+            "entity_type": "flight", "entity_id": flight_id, "company_id": cid,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "after_data": json.dumps({"flight_number": flight.get("flight_number"),
+                                      "total": total}, ensure_ascii=False),
+        }).execute()
+    except Exception as e:
+        log.warning("receipts audit failed: %s", e)
+
+    return {
+        "flight_id": flight_id,
+        "flight_number": flight.get("flight_number") or "",
+        "route": f"{flight.get('origin_code') or ''}-{flight.get('destination_code') or ''}",
+        "departure_time": flight.get("departure_time"),
+        "publish_status": flight.get("publish_status") or "draft",
+        "roster_finalized_status": flight.get("roster_finalized_status") or "",
+        "gd_status": flight.get("gd_status") or "",
+        "summary": {
+            "total_sent": total,
+            "total_read": total_read,
+            "total_unread": total - total_read,
+            "read_percentage": round(total_read * 100 / total) if total else 0,
+            "last_read_at": last_read,
+        },
+        "items": items,
+    }
 
 
 def _min_crew_shortfalls(sb, flight: dict) -> list[str]:
@@ -636,14 +972,27 @@ async def finalize_roster(flight_id: str, current_user: CurrentUser, sb: SbClien
                    "يلزم تشغيل ترحيل قاعدة البيانات (roster_finalized columns)",
         )
 
-    # ── Idempotency: already finalised → no-op, no new notifications. ──
-    if flight.get("roster_finalized_status") == "finalized":
+    # ── Idempotency: already finalised AND not stale → no-op. A flight whose
+    # crew changed after approval is marked gd_status='stale' (see
+    # mark_gd_stale_if_finalized); re-finalising it is allowed so the GD can be
+    # regenerated for the updated roster. ──
+    if flight.get("roster_finalized_status") == "finalized" \
+            and flight.get("gd_status") != "stale":
         return {
             "ok": True, "flight_id": flight_id, "already_finalized": True,
             "crew_notified": 0, "notified_crew_ids": [],
             "finalized_at": flight.get("roster_finalized_at"),
             "finalized_by": flight.get("roster_finalized_by"),
+            "gd_status": flight.get("gd_status"),
         }
+
+    # ── REG gate: no final approval without the aircraft tail (it's the
+    # aircraft's identity on the GD that goes to the crew). ──
+    if not _normalize_reg(flight.get("aircraft_registration")):
+        raise HTTPException(
+            status_code=422,
+            detail="لا يمكن اعتماد الجدول النهائي بدون رقم تسجيل الطائرة (REG).",
+        )
 
     # ── Minimum-crew (under-staffing) gate ────────────────────────
     shortfalls = _min_crew_shortfalls(sb, flight)
@@ -652,6 +1001,40 @@ async def finalize_roster(flight_id: str, current_user: CurrentUser, sb: SbClien
             status_code=422,
             detail="Minimum crew requirement not met — لم يكتمل الحد الأدنى للطاقم: "
                    + "، ".join(shortfalls),
+        )
+
+    # ── Crew-acceptance gate: the FINAL roster needs every operating crew to
+    #    have explicitly ACCEPTED (or be admin-confirmed by a supervisor).
+    #    pending_acceptance / declined block — reading a notification is NOT
+    #    acceptance. ──
+    blockers = _acceptance_blockers(sb, flight_id)
+    if blockers:
+        listing = "؛ ".join(
+            f"{b['crew_name']} ({b['rank']}) — "
+            f"{'رفض' if b['status'] == 'declined' else 'بانتظار الموافقة'}"
+            for b in blockers)
+        try:
+            sb.table("audit_log").insert({
+                "user_id": current_user["id"],
+                "user_name": current_user.get("name_ar") or current_user.get("name_en")
+                             or current_user.get("email", ""),
+                "action": "finalize_blocked_due_to_pending_acceptance",
+                "entity_type": "flight", "entity_id": flight_id,
+                "company_id": current_user["company_id"],
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "after_data": json.dumps({
+                    "flight_number": flight.get("flight_number"),
+                    "blockers": [{"crew_id": b["row"].get("crew_id"),
+                                  "crew_name": b["crew_name"],
+                                  "status": b["status"]} for b in blockers],
+                }, ensure_ascii=False),
+            }).execute()
+        except Exception as e:
+            log.warning("finalize-blocked audit failed: %s", e)
+        raise HTTPException(
+            status_code=422,
+            detail="لا يمكن اعتماد الجدول النهائي لأن بعض أفراد الطاقم لم يوافقوا "
+                   "بعد أو رفضوا التكليف: " + listing,
         )
 
     # Crew on this sector, minus any the caller already notified elsewhere in
@@ -677,11 +1060,16 @@ async def finalize_roster(flight_id: str, current_user: CurrentUser, sb: SbClien
     # ── Persist finalisation state FIRST — if we cannot save it, we abort
     # BEFORE notifying (no notifications without a recorded approval). ──
     now = datetime.now(timezone.utc).isoformat()
+    gd_version = (flight.get("gd_version") or 0) + 1
     try:
         sb.table("flights").update({
             "roster_finalized_status": "finalized",
             "roster_finalized_at": now,
             "roster_finalized_by": current_user["id"],
+            # GD becomes downloadable by Flight Ops the moment the roster is
+            # finalised; version bumps so each (re)finalise is a new GD revision.
+            "gd_status": "ready",
+            "gd_version": gd_version,
             "updated_at": now,
         }).eq("id", flight_id).execute()
     except Exception as e:
@@ -782,6 +1170,7 @@ async def finalize_roster(flight_id: str, current_user: CurrentUser, sb: SbClien
                 "crew_notified": len(user_ids),
                 "crew_total": len(crew_ids),
                 "finalized_at": now,
+                "gd_version": gd_version,
             }, ensure_ascii=False),
             "company_id": current_user["company_id"],
             "created_at": now,
@@ -789,11 +1178,467 @@ async def finalize_roster(flight_id: str, current_user: CurrentUser, sb: SbClien
     except Exception as e:
         log.warning("audit_log insert failed for finalize_roster: %s", str(e)[:200])
 
+    # ── Tell Flight Ops the GD is ready to download. Best-effort — a notify
+    # failure must never undo a successful finalisation. ──
+    try:
+        _notify_flight_ops_gd_ready(sb, current_user["company_id"], flight)
+    except Exception as e:
+        log.warning("flight-ops GD-ready notify failed for %s: %s", flight_id, e)
+
     return {
         "ok": True, "flight_id": flight_id, "already_finalized": False,
         "crew_notified": len(user_ids), "notified_crew_ids": notify_crew_ids,
         "finalized_at": now, "finalized_by": current_user["id"],
+        "gd_status": "ready", "gd_version": gd_version,
     }
+
+
+# ── GD (General Declaration) workflow — state + Flight-Ops notifications ──────
+# GD is GENERATED client-side (the official form lives in the Flutter app so
+# passport data never leaves the device). The server only tracks STATE: a flight
+# becomes gd_status='ready' on finalise, and 'stale' if its crew changes after.
+# Flight Ops are notified at each transition and download the official file
+# (gated to finalised flights) from their portal.
+_GD_NOTIFY_ROLES = (
+    "flight_operations", "flight_operations_admin", "ops_manager", "super_admin",
+)
+
+
+def _flight_label(flight: dict) -> tuple[str, str, str]:
+    """(flight_number, 'ORIG-DEST', 'YYYY-MM-DD') for notification text."""
+    num = flight.get("flight_number", "")
+    route = f"{flight.get('origin_code', '')}-{flight.get('destination_code', '')}"
+    dep = (flight.get("departure_time") or "")[:10]
+    return num, route, dep
+
+
+def _insert_role_notifications(sb, company_id: str, roles, ntype: str,
+                               title_ar: str, title_en: str,
+                               msg_ar: str, msg_en: str, flight_id) -> int:
+    """Fan out one in-app (+ best-effort push) notification to every active user
+    whose role is in [roles]. Returns how many were notified."""
+    users = (sb.table("users").select("id,role")
+             .eq("company_id", company_id).eq("is_active", True).execute().data) or []
+    targets = [u["id"] for u in users if u.get("role") in roles]
+    if not targets:
+        return 0
+    now = datetime.now(timezone.utc).isoformat()
+    sb.table("notifications").insert([{
+        "id": str(uuid.uuid4()), "user_id": uid, "type": ntype,
+        "title_ar": title_ar, "title_en": title_en,
+        "message_ar": msg_ar, "message_en": msg_en,
+        "body_ar": msg_ar, "body_en": msg_en,
+        "reference_id": flight_id, "reference_type": "flight",
+        "related_flight_id": flight_id,
+        "is_read": False, "created_at": now,
+    } for uid in targets]).execute()
+    try:
+        push_service.send_to_users(sb, targets, title=title_ar, body=msg_ar,
+                                   data={"type": ntype, "reference_id": str(flight_id),
+                                         "reference_type": "flight"})
+    except Exception:
+        pass  # push is best-effort; the in-app notification is already saved
+    return len(targets)
+
+
+def _notify_flight_ops_gd_ready(sb, company_id: str, flight: dict) -> int:
+    num, route, dep = _flight_label(flight)
+    return _insert_role_notifications(
+        sb, company_id, _GD_NOTIFY_ROLES, "gd_ready",
+        "GD جاهز للتحميل", "GD ready to download",
+        f"تم اكتمال واعتماد طاقم الرحلة {num} لمسار {route} بتاريخ {dep}. ملف GD جاهز للتحميل.",
+        f"Roster for flight {num} ({route}) on {dep} is finalised. The GD file is ready to download.",
+        flight.get("id"),
+    )
+
+
+def _acceptance_status_of(row: dict) -> str:
+    """Derived acceptance state of an assignment row.
+    declined > admin_confirmed > accepted > pending_acceptance."""
+    if row.get("declined"):
+        return "declined"
+    if row.get("admin_confirmed"):
+        return "admin_confirmed"
+    if row.get("acknowledged"):
+        return "accepted"
+    return "pending_acceptance"
+
+
+def _acceptance_blockers(sb, flight_id: str) -> list[dict]:
+    """OPERATING crew whose acceptance blocks final approval: still
+    pending_acceptance or declined. accepted / admin_confirmed pass.
+    Non-operating riders (deadhead/standby/observer/training) never block."""
+    rows = (sb.table("assignments").select("*")
+            .eq("flight_id", flight_id).execute().data) or []
+    out = []
+    for r in rows:
+        if (r.get("duty_type") or "operating") != "operating":
+            continue
+        st = _acceptance_status_of(r)
+        if st in ("pending_acceptance", "declined"):
+            out.append({"row": r, "status": st})
+    if not out:
+        return []
+    crew_ids = [b["row"].get("crew_id") for b in out if b["row"].get("crew_id")]
+    names: dict = {}
+    if crew_ids:
+        for c in (sb.table("crew").select("id, full_name_ar, full_name_en, rank")
+                  .in_("id", crew_ids).execute().data) or []:
+            names[c["id"]] = c
+    for b in out:
+        c = names.get(b["row"].get("crew_id"), {})
+        b["crew_name"] = c.get("full_name_ar") or c.get("full_name_en") or "—"
+        b["rank"] = b["row"].get("assigned_role") or c.get("rank") or ""
+    return out
+
+
+def _gd_blocking_reasons(sb, flight: dict) -> list[str]:
+    """Why a flight's official GD cannot be produced (empty = OK to generate)."""
+    reasons: list[str] = []
+    if not _normalize_reg(flight.get("aircraft_registration")):
+        reasons.append("رقم تسجيل الطائرة (REG) غير متوفر")
+    asg = (sb.table("assignments").select("crew_id")
+           .eq("flight_id", flight["id"]).execute().data) or []
+    if not [a for a in asg if a.get("crew_id")]:
+        reasons.append("لا يوجد طاقم معيّن")
+    reasons.extend(_min_crew_shortfalls(sb, flight))
+    for b in _acceptance_blockers(sb, flight["id"]):
+        reasons.append(f"{b['crew_name']} "
+                       f"({'رفض التكليف' if b['status'] == 'declined' else 'لم يوافق بعد'})")
+    return reasons
+
+
+def mark_gd_stale_if_finalized(sb, company_id: str, flight_id: str, actor: Optional[dict] = None) -> None:
+    """If a FINALISED flight's crew changed, flag its GD 'stale' + alert Flight
+    Ops that it needs re-approval. Best-effort: never raises into the caller
+    (a crew add/remove must not fail because of this side effect)."""
+    log = logging.getLogger(__name__)
+    try:
+        res = (sb.table("flights").select("*")
+               .eq("id", flight_id).eq("company_id", company_id).execute())
+        if not res.data:
+            return
+        flight = res.data[0]
+        if flight.get("roster_finalized_status") != "finalized":
+            return  # never finalised → nothing to invalidate
+        if flight.get("gd_status") == "stale":
+            return  # already flagged
+        now = datetime.now(timezone.utc).isoformat()
+        sb.table("flights").update({"gd_status": "stale", "updated_at": now}) \
+            .eq("id", flight_id).execute()
+        num, route, _ = _flight_label(flight)
+        _insert_role_notifications(
+            sb, company_id, _GD_NOTIFY_ROLES, "gd_stale",
+            "GD يحتاج إعادة اعتماد", "GD needs re-approval",
+            f"تغيّر طاقم الرحلة {num} ({route}) بعد الاعتماد — يلزم إعادة اعتماد/توليد ملف GD.",
+            f"Crew of flight {num} ({route}) changed after finalisation — GD needs re-approval/regeneration.",
+            flight_id,
+        )
+        try:
+            audit = {
+                "action": "gd_marked_stale", "entity_type": "flight",
+                "entity_id": flight_id, "company_id": company_id, "created_at": now,
+                "after_data": json.dumps({"flight_number": flight.get("flight_number", "")},
+                                         ensure_ascii=False),
+            }
+            if actor:
+                audit["user_id"] = actor.get("id")
+                audit["user_name"] = (actor.get("name_ar") or actor.get("name_en")
+                                      or actor.get("email", ""))
+            sb.table("audit_log").insert(audit).execute()
+        except Exception:
+            pass
+    except Exception as e:
+        log.warning("mark_gd_stale_if_finalized failed for %s: %s", flight_id, e)
+
+
+@router.post("/{flight_id}/gendec/regenerate")
+async def regenerate_gendec(flight_id: str, current_user: CurrentUser, sb: SbClient):
+    """Re-approve a STALE (crew-changed) finalised flight so its GD is current
+    again. Re-runs the same gates as finalise (REG + minimum crew + has crew),
+    bumps gd_version, and re-alerts Flight Ops — WITHOUT re-spamming the crew
+    (use finalize-roster for the first approval)."""
+    if current_user.get("role") not in _ROSTER_APPROVERS and not current_user.get("is_superuser"):
+        raise ForbiddenError("إعادة توليد GD يتطلب صلاحية مجدول/مشرف")
+    res = (sb.table("flights").select("*")
+           .eq("id", flight_id).eq("company_id", current_user["company_id"]).execute())
+    if not res.data:
+        raise NotFoundError("Flight", flight_id)
+    flight = res.data[0]
+    if "gd_status" not in flight:
+        raise HTTPException(status_code=503,
+                            detail="GD migration missing — يلزم تشغيل ترحيل gd_status")
+    if flight.get("roster_finalized_status") != "finalized":
+        raise HTTPException(status_code=409,
+                            detail="الرحلة غير معتمدة بعد — استخدم اعتماد الجدول النهائي أولاً.")
+    reasons = _gd_blocking_reasons(sb, flight)
+    if reasons:
+        raise HTTPException(status_code=422, detail="تعذّر توليد GD: " + "، ".join(reasons))
+
+    now = datetime.now(timezone.utc).isoformat()
+    gd_version = (flight.get("gd_version") or 0) + 1
+    sb.table("flights").update({
+        "gd_status": "ready", "gd_version": gd_version, "updated_at": now,
+    }).eq("id", flight_id).execute()
+    try:
+        _notify_flight_ops_gd_ready(sb, current_user["company_id"], flight)
+    except Exception as e:
+        logging.getLogger(__name__).warning("GD-ready notify (regenerate) failed: %s", e)
+    try:
+        sb.table("audit_log").insert({
+            "user_id": current_user["id"],
+            "user_name": current_user.get("name_ar") or current_user.get("name_en")
+                         or current_user.get("email", ""),
+            "action": "gd_regenerated", "entity_type": "flight", "entity_id": flight_id,
+            "company_id": current_user["company_id"], "created_at": now,
+            "after_data": json.dumps({"gd_version": gd_version}, ensure_ascii=False),
+        }).execute()
+    except Exception:
+        pass
+    return {"ok": True, "flight_id": flight_id, "gd_status": "ready", "gd_version": gd_version}
+
+
+@router.post("/{flight_id}/gendec/log-download")
+async def log_gendec_download(flight_id: str, current_user: CurrentUser, sb: SbClient,
+                              data: Optional[dict] = Body(default=None)):
+    """Audit a GD download (the file is generated client-side). Records who
+    downloaded which format so the official document has a paper trail (#10)."""
+    fmt = str((data or {}).get("format") or "pdf").lower()
+    try:
+        sb.table("audit_log").insert({
+            "user_id": current_user["id"],
+            "user_name": current_user.get("name_ar") or current_user.get("name_en")
+                         or current_user.get("email", ""),
+            "action": "gd_downloaded", "entity_type": "flight", "entity_id": flight_id,
+            "company_id": current_user["company_id"],
+            "after_data": json.dumps({"format": fmt}, ensure_ascii=False),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+    except Exception as e:
+        logging.getLogger(__name__).warning("gd download audit failed: %s", e)
+    return {"ok": True}
+
+
+# ── OCC: notify a flight's crew (a SAFE operational action) ──────────────────
+# Sends a free-text message to the crew on a flight. It does NOT change the
+# flight, the assignments, or FDP — it only creates notifications + an audit row.
+_CREW_NOTIFIERS = _PUBLISH_TOGGLERS | {
+    "flight_operations", "flight_operations_admin", "flight_ops",
+}
+# Operations staff who get a copy when target == 'crew_ops'.
+_OPS_NOTIFY_ROLES = {
+    "super_admin", "admin", "ops_manager",
+    "flight_operations", "flight_operations_admin", "flight_ops",
+    "flight_movement", "flight_movement_admin",
+}
+_NOTIFY_SEVERITIES = {"info", "warning", "urgent"}
+_SEVERITY_PREFIX = {"info": "", "warning": "⚠ ", "urgent": "🔴 "}
+
+
+@router.post("/{flight_id}/notify-crew")
+async def notify_flight_crew(flight_id: str, data: dict, current_user: CurrentUser, sb: SbClient):
+    if current_user.get("role") not in _CREW_NOTIFIERS and not current_user.get("is_superuser"):
+        raise ForbiddenError("غير مصرح بإرسال إشعارات للطاقم")
+
+    flight_res = sb.table("flights").select("*") \
+        .eq("id", flight_id).eq("company_id", current_user["company_id"]).execute()
+    if not flight_res.data:
+        raise NotFoundError("Flight", flight_id)
+    flight = flight_res.data[0]
+
+    message = str(data.get("message") or "").strip()
+    if not message:
+        raise HTTPException(status_code=422, detail="نص الرسالة مطلوب")
+    severity = str(data.get("severity") or "info").lower()
+    if severity not in _NOTIFY_SEVERITIES:
+        severity = "info"
+    target = str(data.get("target") or "all_crew").lower()  # all_crew | captain | crew_ops
+
+    asg = (sb.table("assignments").select("crew_id, duty_type")
+           .eq("flight_id", flight_id).execute().data) or []
+    if target == "captain":
+        crew_ids = [a["crew_id"] for a in asg if a.get("crew_id")]
+        if crew_ids:
+            ranks = (sb.table("crew").select("id,rank").in_("id", crew_ids).execute().data) or []
+            crew_ids = [r["id"] for r in ranks if is_captain_rank(r.get("rank"))]
+    else:  # all_crew | crew_ops → the operating crew
+        crew_ids = [a["crew_id"] for a in asg
+                    if a.get("crew_id") and (a.get("duty_type") or "operating") == "operating"]
+
+    user_ids: set = set()
+    if crew_ids:
+        urows = (sb.table("users").select("id,crew_id")
+                 .eq("company_id", current_user["company_id"])
+                 .in_("crew_id", crew_ids).execute().data) or []
+        user_ids.update(u["id"] for u in urows if u.get("id"))
+
+    # 'crew_ops' → also send a copy to the OCC / operations staff.
+    if target == "crew_ops":
+        ops_rows = (sb.table("users").select("id,role")
+                    .eq("company_id", current_user["company_id"]).eq("is_active", True)
+                    .execute().data) or []
+        user_ids.update(u["id"] for u in ops_rows if u.get("role") in _OPS_NOTIFY_ROLES)
+    user_ids = list(user_ids)
+
+    default_title = {"info": "رسالة عمليات", "warning": "تنبيه عمليات", "urgent": "رسالة عاجلة"}[severity]
+    title = (str(data.get("title") or "").strip()) or default_title
+    title = _SEVERITY_PREFIX[severity] + title
+    flight_num = flight.get("flight_number", "")
+    now = datetime.now(timezone.utc).isoformat()
+
+    if user_ids:
+        sb.table("notifications").insert([{
+            "id": str(uuid.uuid4()), "user_id": uid,
+            "type": "occ_message",
+            "title_ar": title, "title_en": title,
+            "message_ar": message, "message_en": message,
+            "body_ar": message, "body_en": message,
+            "reference_id": flight_id, "reference_type": "flight",
+            "related_flight_id": flight_id,
+            "is_read": False, "created_at": now,
+        } for uid in user_ids]).execute()
+        try:
+            push_service.send_to_users(
+                sb, user_ids, title=f"{title} — {flight_num}", body=message,
+                data={"type": "occ_message", "reference_id": str(flight_id),
+                      "reference_type": "flight"})
+        except Exception as pe:
+            logging.getLogger(__name__).warning("notify-crew push failed: %s", pe)
+
+    # Audit — record WHO sent WHAT to whom (no flight/assignment change).
+    try:
+        sb.table("audit_log").insert({
+            "user_id": current_user["id"],
+            "user_name": current_user.get("name_ar") or current_user.get("name_en")
+                         or current_user.get("email", ""),
+            "action": "occ_notify_crew", "entity_type": "flight", "entity_id": flight_id,
+            "company_id": current_user["company_id"], "created_at": now,
+            "after_data": json.dumps({
+                "flight_number": flight_num, "severity": severity, "target": target,
+                "recipients": len(user_ids), "title": title,
+            }, ensure_ascii=False),
+        }).execute()
+    except Exception as e:
+        logging.getLogger(__name__).warning("notify-crew audit failed: %s", e)
+
+    return {"ok": True, "sent": len(user_ids), "severity": severity, "target": target}
+
+
+# ── OCC: delay a flight (first flight-data-CHANGING OCC action) ──────────────
+# Sets status='delayed' + delay_minutes (ETD = STD + delay; STD itself is NOT
+# touched). Optionally notifies crew/ops. Always audited.
+@router.post("/{flight_id}/delay")
+async def delay_flight(flight_id: str, data: dict, current_user: CurrentUser, sb: SbClient):
+    if current_user.get("role") not in _FLIGHT_EDITORS and not current_user.get("is_superuser"):
+        raise ForbiddenError("غير مصرح بتأخير الرحلة")
+
+    flight_res = sb.table("flights").select("*") \
+        .eq("id", flight_id).eq("company_id", current_user["company_id"]).execute()
+    if not flight_res.data:
+        raise NotFoundError("Flight", flight_id)
+    flight = flight_res.data[0]
+
+    # Derive the delay (minutes) from a new ETD or an explicit delay_minutes.
+    # STD (departure_time) is preserved.
+    try:
+        std = datetime.fromisoformat(str(flight.get("departure_time")).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail="الموعد المجدول للرحلة غير صالح")
+
+    new_etd = data.get("new_etd")
+    if new_etd:
+        try:
+            etd = datetime.fromisoformat(str(new_etd).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=422, detail="صيغة وقت ETD غير صحيحة")
+        dm = int(round((etd - std).total_seconds() / 60))
+    elif data.get("delay_minutes") is not None:
+        try:
+            dm = int(data["delay_minutes"])
+        except (TypeError, ValueError):
+            dm = 0
+    else:
+        raise HTTPException(status_code=422, detail="وقت ETD الجديد مطلوب")
+    if dm <= 0:
+        raise HTTPException(status_code=422, detail="يجب أن يكون وقت ETD بعد الموعد المجدول")
+
+    reason = str(data.get("reason") or "").strip().lower()
+    if reason and reason not in CANCELLATION_REASONS:
+        raise HTTPException(status_code=422,
+                            detail=f"سبب التأخير يجب أن يكون أحد: {', '.join(sorted(CANCELLATION_REASONS))}")
+    note = str(data.get("note") or "").strip()
+
+    now = datetime.now(timezone.utc).isoformat()
+    update = {"status": "delayed", "delay_minutes": dm, "updated_at": now}
+    if reason:
+        update["cancellation_reason"] = reason   # column reused for delay reason
+    if note:
+        update["cancellation_notes"] = note[:500]
+    sb.table("flights").update(update).eq("id", flight_id).execute()
+
+    # ── Notify (optional) crew and/or operations. ──
+    notify_crew = bool(data.get("notify_crew", True))
+    notify_ops = bool(data.get("notify_ops", False))
+    fnum = flight.get("flight_number", "")
+    origin = flight.get("origin_code", "")
+    dest = flight.get("destination_code", "")
+    title_ar = f"تأخّر الرحلة {fnum}"
+    title_en = f"Flight {fnum} delayed"
+    msg_ar = f"رحلة {fnum} ({origin} → {dest}) تأخّرت {dm} دقيقة" + (f" — {note}" if note else "")
+    msg_en = f"Flight {fnum} ({origin} → {dest}) delayed {dm} min" + (f" — {note}" if note else "")
+    targets: set = set()
+    if notify_crew:
+        asg = (sb.table("assignments").select("crew_id, duty_type")
+               .eq("flight_id", flight_id).execute().data) or []
+        crew_ids = [a["crew_id"] for a in asg
+                    if a.get("crew_id") and (a.get("duty_type") or "operating") == "operating"]
+        if crew_ids:
+            urows = (sb.table("users").select("id,crew_id")
+                     .eq("company_id", current_user["company_id"])
+                     .in_("crew_id", crew_ids).execute().data) or []
+            targets.update(u["id"] for u in urows if u.get("id"))
+    if notify_ops:
+        ops = (sb.table("users").select("id,role")
+               .eq("company_id", current_user["company_id"]).eq("is_active", True)
+               .execute().data) or []
+        targets.update(u["id"] for u in ops if u.get("role") in _OPS_NOTIFY_ROLES)
+    targets = list(targets)
+    if targets:
+        try:
+            sb.table("notifications").insert([{
+                "id": str(uuid.uuid4()), "user_id": uid, "type": "flight_disruption",
+                "title_ar": title_ar, "title_en": title_en,
+                "message_ar": msg_ar, "message_en": msg_en,
+                "body_ar": msg_ar, "body_en": msg_en,
+                "reference_id": flight_id, "reference_type": "flight",
+                "related_flight_id": flight_id, "is_read": False, "created_at": now,
+            } for uid in targets]).execute()
+            push_service.send_to_users(sb, targets, title=title_ar, body=msg_ar,
+                                       data={"type": "flight_disruption",
+                                             "reference_id": str(flight_id),
+                                             "reference_type": "flight"})
+        except Exception as e:
+            logging.getLogger(__name__).warning("delay notify failed: %s", e)
+
+    # ── Audit. ──
+    try:
+        sb.table("audit_log").insert({
+            "user_id": current_user["id"],
+            "user_name": current_user.get("name_ar") or current_user.get("name_en")
+                         or current_user.get("email", ""),
+            "action": "occ_delay_flight", "entity_type": "flight", "entity_id": flight_id,
+            "company_id": current_user["company_id"], "created_at": now,
+            "after_data": json.dumps({
+                "flight_number": fnum, "delay_minutes": dm,
+                "reason": reason or None, "note": note or None,
+                "recipients": len(targets),
+            }, ensure_ascii=False),
+        }).execute()
+    except Exception as e:
+        logging.getLogger(__name__).warning("delay audit failed: %s", e)
+
+    return {"ok": True, "flight_id": flight_id, "status": "delayed",
+            "delay_minutes": dm, "recipients": len(targets)}
 
 
 VALID_STATUSES = {"scheduled", "boarding", "departed", "landed", "cancelled", "diverted", "delayed"}

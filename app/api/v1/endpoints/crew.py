@@ -1,4 +1,4 @@
-import os, re, uuid, math, secrets, string, logging
+import os, re, json, uuid, math, secrets, string, logging
 from typing import Optional
 from datetime import datetime, timezone, date
 from fastapi import APIRouter, Query, HTTPException
@@ -10,6 +10,7 @@ from app.api.v1.endpoints.assignments import (
     SCHED_ALLOWED_ROLES, ALLOC_ALLOWED_CATEGORIES,
 )
 from app.core.crew_roles import roles_in_categories, expand_with_legacy, normalize_role
+from app.core.monthly_hours import crew_flight_hours
 
 
 def _restricted_ranks(user: dict) -> Optional[set]:
@@ -34,6 +35,25 @@ def _restricted_ranks(user: dict) -> Optional[set]:
 def _generate_temp_password() -> str:
     alphabet = string.ascii_letters + string.digits + "!@#$%"
     return ''.join(secrets.choice(alphabet) for _ in range(12))
+
+
+# ── Contact phones (primary required, secondary optional) ────────────────────
+# Numbers only (a single leading '+' allowed); supports Iraqi 07xxxxxxxxx and
+# +9647xxxxxxxxx. Spaces/dashes are stripped before validation/storage.
+def _normalize_phone(value) -> str:
+    return re.sub(r"[\s\-]", "", str(value or "").strip())
+
+
+def _valid_phone(p: str) -> bool:
+    return bool(re.fullmatch(r"\+?[0-9]{7,15}", p))
+
+
+def _mask_phone(p) -> str:
+    """Hide the middle of a number for the audit log, e.g. 07******678."""
+    s = str(p or "")
+    if len(s) <= 5:
+        return "*" * len(s)
+    return s[:2] + "*" * (len(s) - 5) + s[-3:]
 
 router = APIRouter(prefix="/crew", tags=["Crew Management"])
 
@@ -210,6 +230,22 @@ async def create_crew(data: dict, current_user: CurrentUser, sb: SbClient):
     if not (data.get("operator_company_id") or "").strip():
         raise HTTPException(status_code=422, detail="operator_company_id (الشركة) is required")
 
+    # ── Contact phones: primary required + valid; secondary optional + valid.
+    # Legacy `phone` column is kept in sync with the primary so older readers
+    # don't break. (Falls back to a legacy `phone` value if the client still
+    # sends that key instead of primary_phone.)
+    primary = _normalize_phone(data.get("primary_phone") or data.get("phone"))
+    if not primary:
+        raise HTTPException(status_code=422, detail="رقم الهاتف الأساسي مطلوب")
+    if not _valid_phone(primary):
+        raise HTTPException(status_code=422, detail="صيغة رقم الهاتف الأساسي غير صحيحة")
+    data["primary_phone"] = primary
+    data["phone"] = primary
+    sec = _normalize_phone(data.get("secondary_phone"))
+    if sec and not _valid_phone(sec):
+        raise HTTPException(status_code=422, detail="صيغة رقم الهاتف البديل غير صحيحة")
+    data["secondary_phone"] = sec or None
+
     crew_id = str(uuid.uuid4())
     data["id"] = crew_id
     data["company_id"] = current_user["company_id"]
@@ -309,9 +345,11 @@ async def update_crew(crew_id: str, data: dict, current_user: CurrentUser, sb: S
     # go through a dedicated, field-whitelisted endpoint when we add it.
     _ensure_editor(current_user)
 
-    existing = sb.table("crew").select("id").eq("id", crew_id).eq("company_id", current_user["company_id"]).execute()
+    existing = sb.table("crew").select("id, primary_phone, secondary_phone, phone") \
+        .eq("id", crew_id).eq("company_id", current_user["company_id"]).execute()
     if not existing.data:
         raise NotFoundError("Crew member", crew_id)
+    before = existing.data[0]
 
     # Guard roster-name uniqueness on edit too (excluding this same record).
     if "roster_name" in data:
@@ -319,6 +357,28 @@ async def update_crew(crew_id: str, data: dict, current_user: CurrentUser, sb: S
             sb, current_user["company_id"], data.get("roster_name", ""),
             exclude_crew_id=crew_id,
         )
+
+    # ── Contact phones: validate when present, keep legacy `phone` synced, and
+    # record which phone fields changed (for a masked audit entry after save).
+    phone_changed: dict = {}
+    if "primary_phone" in data:
+        primary = _normalize_phone(data.get("primary_phone"))
+        if not primary:
+            raise HTTPException(status_code=422, detail="رقم الهاتف الأساسي لا يمكن أن يكون فارغاً")
+        if not _valid_phone(primary):
+            raise HTTPException(status_code=422, detail="صيغة رقم الهاتف الأساسي غير صحيحة")
+        data["primary_phone"] = primary
+        data["phone"] = primary  # legacy column stays in sync with the primary
+        old_primary = before.get("primary_phone") or before.get("phone") or ""
+        if primary != old_primary:
+            phone_changed["primary_phone"] = (old_primary, primary)
+    if "secondary_phone" in data:
+        sec = _normalize_phone(data.get("secondary_phone"))
+        if sec and not _valid_phone(sec):
+            raise HTTPException(status_code=422, detail="صيغة رقم الهاتف البديل غير صحيحة")
+        data["secondary_phone"] = sec or None
+        if (sec or None) != (before.get("secondary_phone") or None):
+            phone_changed["secondary_phone"] = (before.get("secondary_phone"), sec or None)
 
     data["updated_at"] = datetime.now(timezone.utc).isoformat()
     # Never overwrite the row's company with a client-supplied value (the form
@@ -332,6 +392,25 @@ async def update_crew(crew_id: str, data: dict, current_user: CurrentUser, sb: S
     except Exception as e:
         logging.getLogger(__name__).exception("crew update failed for %s", crew_id)
         raise HTTPException(status_code=502, detail=f"crew update failed: {str(e)[:300]}")
+
+    # ── Audit phone changes (numbers MASKED — sensitive). One entry per field. ──
+    for field, (old, new) in phone_changed.items():
+        try:
+            sb.table("audit_log").insert({
+                "user_id": current_user["id"],
+                "user_name": current_user.get("name_ar") or current_user.get("name_en")
+                             or current_user.get("email", ""),
+                "action": "crew_contact_updated",
+                "entity_type": "crew",
+                "entity_id": crew_id,
+                "company_id": current_user["company_id"],
+                "before_data": json.dumps({field: _mask_phone(old)}, ensure_ascii=False),
+                "after_data": json.dumps({field: _mask_phone(new)}, ensure_ascii=False),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }).execute()
+        except Exception:
+            logging.getLogger(__name__).warning("crew contact audit failed for %s", crew_id)
+
     return result.data[0] if result.data else {}
 
 
@@ -436,9 +515,14 @@ async def get_crew_flights(crew_id: str, current_user: CurrentUser, sb: SbClient
     # Flight IDs from this crew's assignments — capped + newest-first (this view
     # only shows UPCOMING flights, so recent assignments are what matter). The cap
     # avoids the Supabase 1000-row truncation on long-career crew.
-    assign_res = sb.table("assignments").select("flight_id")\
+    # select("*") (column-safe) so the acceptance fields ride along — the crew
+    # portal card needs assignment_id/acknowledged/declined to show its
+    # موافق/أرفض bar.
+    assign_res = sb.table("assignments").select("*")\
         .eq("crew_id", crew_id).order("created_at", desc=True).limit(2000).execute()
-    flight_ids = [r["flight_id"] for r in (assign_res.data or []) if r.get("flight_id")]
+    asg_by_fid = {r["flight_id"]: r for r in (assign_res.data or [])
+                  if r.get("flight_id")}
+    flight_ids = list(asg_by_fid.keys())
 
     if not flight_ids:
         return []
@@ -447,15 +531,48 @@ async def get_crew_flights(crew_id: str, current_user: CurrentUser, sb: SbClient
     # Chunk the IN() filter (PostgREST caps the list length) and merge the pages.
     rows: list = []
     for i in range(0, len(flight_ids), 500):
-        res = sb.table("flights").select("*")\
+        q = sb.table("flights").select("*")\
             .in_("id", flight_ids[i:i + 500])\
             .eq("company_id", current_user["company_id"])\
             .neq("status", "cancelled")\
-            .gte("departure_time", today)\
-            .order("departure_time", desc=False).execute()
+            .gte("departure_time", today)
+        # Crew must NEVER see a DRAFT roster: the duty becomes visible (and the
+        # crew is notified) only when the scheduler publishes the flight.
+        # Ops/admin viewers still see drafts (they're building them).
+        if current_user.get("role") == "crew":
+            q = q.eq("publish_status", "published")
+        res = q.order("departure_time", desc=False).execute()
         rows.extend(res.data or [])
     rows.sort(key=lambda f: f.get("departure_time") or "")
+
+    # Attach THIS crew's assignment lifecycle to each flight — the portal card
+    # renders the موافق/أرفض bar only when assignment_id is present.
+    for f in rows:
+        a = asg_by_fid.get(f.get("id")) or {}
+        f["assignment_id"]   = a.get("id")
+        f["acknowledged"]    = bool(a.get("acknowledged"))
+        f["acknowledged_at"] = a.get("acknowledged_at")
+        f["declined"]        = bool(a.get("declined"))
+        f["declined_at"]     = a.get("declined_at")
+        f["decline_reason"]  = a.get("decline_reason")
+        f["admin_confirmed"] = bool(a.get("admin_confirmed"))
+        f["assigned_role"]   = a.get("assigned_role")
+        f["duty_type"]       = a.get("duty_type")
     return rows
+
+
+@router.get("/{crew_id}/flight-hours")
+async def get_crew_flight_hours(crew_id: str, current_user: CurrentUser, sb: SbClient):
+    """Credited flight hours for this crew member, bucketed by period
+    (month / last_28_days / year / total). Computed from
+    `flights.duration_hours` with the same crediting policy as the Monthly
+    Hours report, so the crew profile shows real figures (the stored
+    crew.monthly_flight_hours is not maintained)."""
+    existing = sb.table("crew").select("id").eq("id", crew_id)\
+        .eq("company_id", current_user["company_id"]).execute()
+    if not existing.data:
+        raise NotFoundError("Crew member", crew_id)
+    return crew_flight_hours(sb, current_user["company_id"], crew_id)
 
 
 @router.post("/{crew_id}/block")

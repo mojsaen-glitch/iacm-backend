@@ -172,15 +172,22 @@ async def send_notification(data: dict, current_user: CurrentUser, sb: SbClient)
 # ─── POST /notifications/{id}/read ───────────────────────────────
 @router.post("/{notification_id}/read")
 async def mark_read(notification_id: str, current_user: CurrentUser, sb: SbClient):
-    """يسمح فقط لصاحب الإشعار بتحديده كمقروء. يحدّث سجل التوصيل أيضاً (READ ACK)."""
+    """يسمح فقط لصاحب الإشعار بتحديده كمقروء. يحدّث سجل التوصيل أيضاً (READ ACK).
+    Idempotent: إذا كان مقروءاً مسبقاً يُحفَظ read_at الأصلي (لا يُستبدل)."""
     now = datetime.now(timezone.utc).isoformat()
     result = sb.table("notifications").update({
         "is_read": True,
         "read_at": now,
-    }).eq("id", notification_id).eq("user_id", current_user["id"]).execute()
+    }).eq("id", notification_id).eq("user_id", current_user["id"]) \
+      .eq("is_read", False).execute()
 
     if not result.data:
-        raise NotFoundError("Notification", notification_id)
+        # Already read (idempotent — keep the ORIGINAL read_at) or not yours/missing.
+        own = sb.table("notifications").select("id").eq("id", notification_id) \
+            .eq("user_id", current_user["id"]).execute()
+        if not own.data:
+            raise NotFoundError("Notification", notification_id)
+        return {"message": "الإشعار مقروء مسبقاً"}
 
     # Delivery monitoring: reading implies delivery — stamp both if unset.
     # Best-effort: a missing notification_delivery table must never break read.

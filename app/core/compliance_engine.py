@@ -21,7 +21,7 @@ import json
 import logging
 import re
 from datetime import datetime, date, time, timezone, timedelta
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dc_replace
 from typing import Optional
 
 from app.core.config import settings
@@ -76,16 +76,23 @@ BAGHDAD_OFFSET         = timedelta(hours=3)  # local = UTC+3 (band lookup)
 DUTY_SPLIT_REST_HOURS  = MIN_REST_DOMESTIC
 
 DOCUMENT_LABELS = {
-    "passport":        ("جواز السفر",              "Passport"),
-    "medical":         ("الشهادة الطبية",           "Medical Certificate"),
-    "license":         ("رخصة الطيار",              "Pilot License"),
-    "crew_id":         ("بطاقة الطاقم",             "Crew ID"),
-    "safety":          ("شهادة السلامة",             "Safety Certificate"),
-    "emergency":       ("شهادة الطوارئ",             "Emergency Certificate"),
-    "first_aid":       ("الإسعافات الأولية",         "First Aid"),
-    "crm":             ("شهادة CRM",                 "CRM Certificate"),
-    "dangerous_goods": ("البضائع الخطرة",            "Dangerous Goods"),
-    "visa":            ("التأشيرة",                  "Visa"),
+    "passport":               ("جواز السفر",              "Passport"),
+    "medical":                ("الشهادة الطبية",           "Medical Certificate"),
+    "medical_certificate":    ("الفحص الطبي",              "Medical Certificate"),
+    "license":                ("رخصة الطيار",              "Pilot License"),
+    "crew_license":           ("رخصة الطاقم",              "Crew License"),
+    "cabin_crew_certificate": ("شهادة طاقم الضيافة",        "Cabin Crew Certificate"),
+    "crew_id":                ("بطاقة الطاقم",             "Crew ID"),
+    "safety":                 ("شهادة السلامة",             "Safety Certificate"),
+    "safety_training":        ("تدريب السلامة",            "Safety Training"),
+    "emergency":              ("شهادة الطوارئ",             "Emergency Certificate"),
+    "emergency_training":     ("تدريب الطوارئ",            "Emergency Training"),
+    "first_aid":              ("الإسعافات الأولية",         "First Aid"),
+    "crm":                    ("شهادة CRM",                 "CRM Certificate"),
+    "dangerous_goods":        ("البضائع الخطرة",            "Dangerous Goods"),
+    "visa":                   ("التأشيرة",                  "Visa"),
+    "airport_pass":           ("تصريح المطار",             "Airport Pass"),
+    "other":                  ("وثيقة أخرى",               "Other document"),
 }
 
 TRAINING_LABELS = {
@@ -317,6 +324,149 @@ class ComplianceEngine:
             "duty": duty_summary,
             "checked_at": datetime.now(timezone.utc).isoformat(),
         }
+
+    # ── Connected duty for MANY crew (batched, no N× full engine) ──────────
+    def batch_connected_duty(self, crew_ids: list[str], flight_ids: list[str]) -> list[dict]:
+        """Compliance for assigning MANY crew to ONE connected duty, with all the
+        shared data PRELOADED in a handful of bulk queries instead of running the
+        full engine once per crew (which timed out on multi-crew duties).
+
+        Same rules + same per-crew return shape as `check_connected_duty`. The
+        duty SHAPE (overlap/contiguity/turnaround) and the FDP limit are
+        duty-level — identical for every crew — so they're computed ONCE and
+        copied per crew. Only status/documents/training/flight-hours/
+        qualification/rest are per-crew, and they use the preloaded rows.
+        """
+        # ── Duty flights (ONCE, not per crew) ──
+        rows = self.sb.table("flights").select("*").in_("id", list(flight_ids)).execute().data or []
+        segs = []
+        for f in rows:
+            try:
+                dep = datetime.fromisoformat(f["departure_time"].replace("Z", "+00:00"))
+                arr = datetime.fromisoformat(f["arrival_time"].replace("Z", "+00:00"))
+            except (KeyError, ValueError, TypeError, AttributeError):
+                continue
+            segs.append({"id": f["id"], "dep": dep, "arr": arr,
+                         "origin": (f.get("origin_code") or "").upper(),
+                         "dest": (f.get("destination_code") or "").upper(),
+                         "flight_number": f.get("flight_number", ""),
+                         "aircraft_type": (f.get("aircraft_type") or "").strip(),
+                         "status": f.get("status")})
+        segs.sort(key=lambda s: s["dep"])
+
+        # ── Duty-level issues (shape + FDP) — identical for every crew ──
+        duty_issues: list[ComplianceIssue] = []
+        if len(segs) < 2:
+            duty_issues.append(ComplianceIssue(
+                rule="connected_duty_invalid", severity=Severity.BLOCKING,
+                message_ar="الواجب المتصل يتطلب رحلتين فأكثر صالحتين",
+                message_en="A connected duty needs at least two valid flights"))
+        _tp = self._om_params("turnaround")
+        max_turn = self._pnum(_tp, "max_turnaround_hours", lo=0, hi=12)
+        max_turn = max_turn if max_turn is not None else MAX_TURNAROUND_HOURS
+        for prev, nxt in zip(segs, segs[1:]):
+            gap_h = (nxt["dep"] - prev["arr"]).total_seconds() / 3600.0
+            if nxt["dep"] < prev["arr"]:
+                duty_issues.append(ComplianceIssue(
+                    rule="connected_duty_overlap", severity=Severity.BLOCKING,
+                    message_ar=f"تعارض زمني بين {prev['flight_number']} و{nxt['flight_number']}",
+                    message_en=f"Time overlap between {prev['flight_number']} and {nxt['flight_number']}"))
+            elif nxt["origin"] != prev["dest"]:
+                duty_issues.append(ComplianceIssue(
+                    rule="connected_duty_not_contiguous", severity=Severity.BLOCKING,
+                    message_ar=f"القطاعات غير متّصلة: وصول {prev['dest']} ثم إقلاع {nxt['origin']}",
+                    message_en=f"Sectors not contiguous: arrive {prev['dest']} then depart {nxt['origin']}"))
+            elif gap_h > max_turn:
+                duty_issues.append(ComplianceIssue(
+                    rule="connected_duty_gap_too_long", severity=Severity.BLOCKING,
+                    message_ar=f"الفاصل {gap_h:.1f} ساعة يتجاوز حد الدوران ({max_turn:.0f} ساعة) — هذا واجب منفصل",
+                    message_en=f"Gap {gap_h:.1f}h exceeds turnaround limit ({max_turn:.0f}h) — that is a separate duty",
+                    detail={"gap_hours": round(gap_h, 1), "max": max_turn}))
+
+        is_intl = bool(segs) and any(
+            s["origin"] not in IRAQI_AIRPORTS or s["dest"] not in IRAQI_AIRPORTS for s in segs)
+        if segs:
+            duty_issues += self._evaluate_fdp([(s["dep"], s["arr"]) for s in segs])
+
+        total_flight_min = sum((s["arr"] - s["dep"]).total_seconds() / 60.0 for s in segs)
+        duty_summary = {
+            "sectors": len(segs),
+            "first_departure_utc": segs[0]["dep"].isoformat() if segs else None,
+            "last_arrival_utc": segs[-1]["arr"].isoformat() if segs else None,
+            "total_flight_minutes": int(round(total_flight_min)),
+            "stations": [segs[0]["origin"]] + [s["dest"] for s in segs] if segs else [],
+            "turnarounds": [
+                {"station": prev["dest"],
+                 "minutes": int(round((nxt["dep"] - prev["arr"]).total_seconds() / 60.0))}
+                for prev, nxt in zip(segs, segs[1:])
+            ],
+        }
+
+        # ── Bulk preload per-crew data (a handful of queries, never N×) ──
+        def _in(table, cols, ids, col="id"):
+            out = []
+            for i in range(0, len(ids), 500):
+                out.extend(self.sb.table(table).select(cols)
+                           .in_(col, ids[i:i + 500]).execute().data or [])
+            return out
+
+        crew_map = {c["id"]: c for c in _in("crew", "*", crew_ids)}
+        docs_by: dict[str, list] = {}
+        for d in _in("documents", "*", crew_ids, col="crew_id"):
+            docs_by.setdefault(d.get("crew_id"), []).append(d)
+        train_by: dict[str, list] = {}
+        for t in _in("training_records", "*", crew_ids, col="crew_id"):
+            train_by.setdefault(t.get("crew_id"), []).append(t)
+        asg_rows = _in("assignments", "crew_id,flight_id", crew_ids, col="crew_id")
+        fids = list({a["flight_id"] for a in asg_rows if a.get("flight_id")})
+        fmap = {f["id"]: f for f in _in(
+            "flights", "id,departure_time,arrival_time,duration_hours,status,destination_code", fids)}
+        flights_by_crew: dict[str, list] = {}
+        for a in asg_rows:
+            f = fmap.get(a.get("flight_id"))
+            if f:
+                flights_by_crew.setdefault(a["crew_id"], []).append(f)
+
+        first_origin = segs[0]["origin"] if segs else None
+        first_id = segs[0]["id"] if segs else None
+        first_dep = segs[0]["dep"] if segs else None
+        proj = [(s["dep"], s["arr"]) for s in segs]
+        ac_types = {s["aircraft_type"] for s in segs if s["aircraft_type"]}
+
+        # ── Per crew: reuse the SAME rule logic with preloaded data ──
+        out: list[dict] = []
+        for cid in crew_ids:
+            crew = crew_map.get(cid)
+            if crew is None:
+                out.append({"error": f"Crew member {cid} not found", "status": "UNKNOWN",
+                            "crew_id": cid, "issues": [], "blocking_reasons": []})
+                continue
+            cflights = flights_by_crew.get(cid, [])
+            # Copy duty-level issues so per-crew _apply_om can't mutate shared ones.
+            issues: list[ComplianceIssue] = [dc_replace(i) for i in duty_issues]
+            issues += self._check_crew_status(crew)
+            issues += self._check_documents(cid, docs=docs_by.get(cid, []))
+            issues += self._check_training(cid, records=train_by.get(cid, []))
+            issues += self._check_flight_hours(cid, crew, projected_segs=proj, crew_flights=cflights)
+            for ac in ac_types:
+                issues += self._check_aircraft_qualification(crew, ac)
+            if segs:
+                issues += self._check_rest(cid, first_dep, is_intl, first_id,
+                                           crew_flights=cflights, next_origin=first_origin)
+            issues = self._apply_om(issues)
+            status = self._overall_status(issues)
+            out.append({
+                "crew_id": cid,
+                "crew_name_ar": crew.get("full_name_ar", ""),
+                "crew_name_en": crew.get("full_name_en", ""),
+                "status": status,
+                "issues": [i.to_dict() for i in issues],
+                "blocking_reasons": [i.message_ar for i in issues if i.severity == Severity.BLOCKING],
+                "requires_approval": any((i.detail or {}).get("requires_approval") for i in issues),
+                "duty": duty_summary,
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+            })
+        return out
 
     # ── Live legality snapshot (OCC countdown) ─────────────────
     @staticmethod
@@ -806,7 +956,7 @@ class ComplianceEngine:
 
     # ── Rule: Documents ────────────────────────────────────────
 
-    def _check_documents(self, crew_id: str) -> list[ComplianceIssue]:
+    def _check_documents(self, crew_id: str, *, docs: Optional[list] = None) -> list[ComplianceIssue]:
         issues = []
         today = date.today()
         # OM overrides: warning window + whether an expired doc hard-blocks.
@@ -815,31 +965,45 @@ class ComplianceEngine:
         warn_days = int(warn_days) if warn_days is not None else WARN_DAYS_BEFORE_EXPIRY
         block_docs = self._pbool(dpar, "block_if_expired", True)
 
-        try:
-            docs = self.sb.table("documents").select("*").eq("crew_id", crew_id).execute().data or []
-        except Exception as e:
-            _log.exception("documents lookup failed for crew_id=%s", crew_id)
-            return [ComplianceIssue(
-                rule="check_documents_unavailable",
-                severity=Severity.CRITICAL,
-                message_ar="تعذّر التحقق من الوثائق — راجع المسؤول قبل التكليف",
-                message_en="Could not verify documents — review before assignment",
-                detail={"error": str(e)[:200]},
-            )]
+        # `docs` may be PRELOADED in bulk by a batch caller (connected-duty) to
+        # avoid one query per crew; otherwise fetch this crew's docs.
+        if docs is None:
+            try:
+                docs = self.sb.table("documents").select("*").eq("crew_id", crew_id).execute().data or []
+            except Exception as e:
+                _log.exception("documents lookup failed for crew_id=%s", crew_id)
+                return [ComplianceIssue(
+                    rule="check_documents_unavailable",
+                    severity=Severity.CRITICAL,
+                    message_ar="تعذّر التحقق من الوثائق — راجع المسؤول قبل التكليف",
+                    message_en="Could not verify documents — review before assignment",
+                    detail={"error": str(e)[:200]},
+                )]
 
         for doc in docs:
-            expiry_str = doc.get("expiry_date")
-            if not expiry_str:
-                continue
-            try:
-                expiry = date.fromisoformat(str(expiry_str)[:10])
-            except (ValueError, TypeError):
-                continue
-
             doc_type = doc.get("document_type", "document")
             label_ar, label_en = DOCUMENT_LABELS.get(doc_type, (doc_type, doc_type))
-            days_diff = (expiry - today).days
+            expiry_str = doc.get("expiry_date")
 
+            # A malformed / missing expiry is NEVER silently ignored — it surfaces
+            # as a REVIEW (warning) so a human checks the record before assigning.
+            expiry = None
+            if expiry_str:
+                try:
+                    expiry = date.fromisoformat(str(expiry_str)[:10])
+                except (ValueError, TypeError):
+                    expiry = None
+            if expiry is None:
+                issues.append(ComplianceIssue(
+                    rule=f"doc_invalid_date_{doc_type}",
+                    severity=Severity.WARNING,
+                    message_ar=f"تاريخ انتهاء غير صالح أو ناقص: {label_ar} — يحتاج مراجعة",
+                    message_en=f"Invalid/missing expiry date: {label_en} — needs review",
+                    detail={"type": doc_type, "expiry_raw": expiry_str, "review": True},
+                ))
+                continue
+
+            days_diff = (expiry - today).days
             if expiry < today:
                 issues.append(ComplianceIssue(
                     rule=f"doc_expired_{doc_type}",
@@ -857,28 +1021,41 @@ class ComplianceEngine:
                     detail={"type": doc_type, "expiry": str(expiry), "days_left": days_diff},
                 ))
 
+            # Unverified documents are REVIEW (non-blocking for now), never treated
+            # as silently valid. Can be escalated to BLOCKING after data cleanup.
+            if not doc.get("is_verified", False):
+                issues.append(ComplianceIssue(
+                    rule=f"doc_unverified_{doc_type}",
+                    severity=Severity.WARNING,
+                    message_ar=f"وثيقة غير موثّقة: {label_ar} — تحتاج توثيق",
+                    message_en=f"Unverified document: {label_en} — needs verification",
+                    detail={"type": doc_type, "review": True, "unverified": True},
+                ))
+
         return issues
 
     # ── Rule: Training Records ─────────────────────────────────
 
-    def _check_training(self, crew_id: str) -> list[ComplianceIssue]:
+    def _check_training(self, crew_id: str, *, records: Optional[list] = None) -> list[ComplianceIssue]:
         issues = []
         today = date.today()
         # OM override: block_if_expired=false downgrades an expired record to a
         # warning instead of a hard block.
         block_training = self._pbool(self._om_params("training"), "block_if_expired", True)
 
-        try:
-            records = self.sb.table("training_records").select("*").eq("crew_id", crew_id).execute().data or []
-        except Exception as e:
-            _log.exception("training lookup failed for crew_id=%s", crew_id)
-            return [ComplianceIssue(
-                rule="check_training_unavailable",
-                severity=Severity.CRITICAL,
-                message_ar="تعذّر التحقق من سجلات التدريب — راجع المسؤول قبل التكليف",
-                message_en="Could not verify training records — review before assignment",
-                detail={"error": str(e)[:200]},
-            )]
+        # `records` may be PRELOADED in bulk by a batch caller (connected-duty).
+        if records is None:
+            try:
+                records = self.sb.table("training_records").select("*").eq("crew_id", crew_id).execute().data or []
+            except Exception as e:
+                _log.exception("training lookup failed for crew_id=%s", crew_id)
+                return [ComplianceIssue(
+                    rule="check_training_unavailable",
+                    severity=Severity.CRITICAL,
+                    message_ar="تعذّر التحقق من سجلات التدريب — راجع المسؤول قبل التكليف",
+                    message_en="Could not verify training records — review before assignment",
+                    detail={"error": str(e)[:200]},
+                )]
 
         for rec in records:
             expiry_str = rec.get("expiry_date")
@@ -915,36 +1092,43 @@ class ComplianceEngine:
     # ── Rule: Flight Hours (FTL) ───────────────────────────────
 
     def _check_flight_hours(self, crew_id: str, crew: dict,
-                            projected_segs: Optional[list] = None) -> list[ComplianceIssue]:
+                            projected_segs: Optional[list] = None,
+                            *, crew_flights: Optional[list] = None) -> list[ComplianceIssue]:
         """FTL check. Counts the crew's CURRENT assigned hours PLUS the hours of
         the flight(s) being assigned now (`projected_segs`: list of (dep, arr)),
         so the decision is made on the PROJECTED total — e.g. 97h current + 5h
-        new = 102h is caught BEFORE the assignment, not after."""
+        new = 102h is caught BEFORE the assignment, not after.
+
+        `crew_flights` (rows with departure_time/duration_hours/status) may be
+        PRELOADED in bulk by a batch caller to avoid the per-crew queries."""
         issues = []
         today = date.today()
         month_start  = today.replace(day=1)
         day28_start  = today - timedelta(days=28)
         year_start   = today.replace(month=1, day=1)
 
-        try:
-            # Get all assignment flight_ids for this crew
-            asgn = self.sb.table("assignments").select("flight_id").eq("crew_id", crew_id).execute().data or []
-            flight_ids = [r["flight_id"] for r in asgn if r.get("flight_id")]
-            flights = []
-            if flight_ids:
-                flights = self.sb.table("flights") \
-                    .select("departure_time,duration_hours,status") \
-                    .in_("id", flight_ids) \
-                    .execute().data or []
-        except Exception as e:
-            _log.exception("flight-hours lookup failed for crew_id=%s", crew_id)
-            return [ComplianceIssue(
-                rule="check_flight_hours_unavailable",
-                severity=Severity.CRITICAL,
-                message_ar="تعذّر التحقق من ساعات الطيران (FTL) — راجع المسؤول",
-                message_en="Could not verify flight-time limits (FTL) — review before assignment",
-                detail={"error": str(e)[:200]},
-            )]
+        if crew_flights is not None:
+            flights = crew_flights
+        else:
+            try:
+                # Get all assignment flight_ids for this crew
+                asgn = self.sb.table("assignments").select("flight_id").eq("crew_id", crew_id).execute().data or []
+                flight_ids = [r["flight_id"] for r in asgn if r.get("flight_id")]
+                flights = []
+                if flight_ids:
+                    flights = self.sb.table("flights") \
+                        .select("departure_time,duration_hours,status") \
+                        .in_("id", flight_ids) \
+                        .execute().data or []
+            except Exception as e:
+                _log.exception("flight-hours lookup failed for crew_id=%s", crew_id)
+                return [ComplianceIssue(
+                    rule="check_flight_hours_unavailable",
+                    severity=Severity.CRITICAL,
+                    message_ar="تعذّر التحقق من ساعات الطيران (FTL) — راجع المسؤول",
+                    message_en="Could not verify flight-time limits (FTL) — review before assignment",
+                    detail={"error": str(e)[:200]},
+                )]
 
         monthly_h = 0.0
         h28d      = 0.0
@@ -1227,6 +1411,9 @@ class ComplianceEngine:
         next_dep:       datetime,
         is_international: bool,
         flight_id:      Optional[str] = None,
+        *,
+        crew_flights:   Optional[list] = None,
+        next_origin:    Optional[str] = None,
     ) -> list[ComplianceIssue]:
         issues = []
         # Live values from the bound OM clause (fallback to config when absent).
@@ -1242,24 +1429,28 @@ class ComplianceEngine:
 
         try:
             next_dep = self._aware(next_dep)
-            asgn = self.sb.table("assignments").select("flight_id").eq("crew_id", crew_id).execute().data or []
-            flight_ids = [r["flight_id"] for r in asgn if r.get("flight_id")]
-            if not flight_ids:
+            # `crew_flights` (arrival_time/destination_code) + `next_origin` may be
+            # PRELOADED in bulk by a batch caller; otherwise fetch per crew.
+            if crew_flights is not None:
+                flights = crew_flights
+            else:
+                asgn = self.sb.table("assignments").select("flight_id").eq("crew_id", crew_id).execute().data or []
+                flight_ids = [r["flight_id"] for r in asgn if r.get("flight_id")]
+                if not flight_ids:
+                    return issues
+                flights = self.sb.table("flights") \
+                    .select("arrival_time,destination_code") \
+                    .in_("id", flight_ids) \
+                    .execute().data or []
+                # Departure station of the flight being assigned — needed to tell a
+                # turnaround (land + take off again from the SAME station) apart
+                # from a true rest gap.
+                if flight_id:
+                    fr = self.sb.table("flights").select("origin_code").eq("id", flight_id).execute().data
+                    if fr:
+                        next_origin = (fr[0].get("origin_code") or "").upper() or None
+            if not flights:
                 return issues
-
-            flights = self.sb.table("flights") \
-                .select("arrival_time,destination_code") \
-                .in_("id", flight_ids) \
-                .execute().data or []
-
-            # Departure station of the flight being assigned — needed to tell a
-            # turnaround (land + take off again from the SAME station) apart from
-            # a true rest gap.
-            next_origin: Optional[str] = None
-            if flight_id:
-                fr = self.sb.table("flights").select("origin_code").eq("id", flight_id).execute().data
-                if fr:
-                    next_origin = (fr[0].get("origin_code") or "").upper() or None
 
             # Find the most recent arrival BEFORE the next departure (and where it
             # landed) — that flight is the candidate previous sector.
@@ -1724,6 +1915,18 @@ class ComplianceEngine:
                     next_available_at = ready_at.isoformat()
 
             readiness = self._readiness_from_result({"issues": issues})
+            # Coarse GREEN/YELLOW/RED/BLOCKED + the hard-stop reasons, so callers
+            # that need a simple status (e.g. the suggest sheet) don't have to run
+            # the per-crew engine. Additive — board consumers ignore extra keys.
+            blocking_reasons = [i["message_ar"] for i in issues if i.get("is_blocking")]
+            if blocking_reasons:
+                comp_status = "BLOCKED"
+            elif any(i.get("severity") == Severity.CRITICAL for i in issues):
+                comp_status = "RED"
+            elif any(i.get("severity") == Severity.WARNING for i in issues):
+                comp_status = "YELLOW"
+            else:
+                comp_status = "GREEN"
             out[cid] = {
                 "crew_id": cid,
                 "monthly_flight_hours": round(monthly, 1),
@@ -1732,6 +1935,8 @@ class ComplianceEngine:
                 "max_monthly_hours": round(max_monthly, 1),
                 "rest_status": rest_status,
                 "next_available_at": next_available_at,
+                "compliance_status": comp_status,
+                "blocking_reasons": blocking_reasons,
                 **readiness,
             }
         return out

@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     DATABASE_URL: Optional[str] = None
     DATABASE_URL_SYNC: Optional[str] = None
 
+    # Shared secret for Vercel Cron → /documents/cron/* (Bearer token). Empty
+    # disables the cron endpoint (returns 403). Set via env, never committed.
+    CRON_SECRET: str = ""
+
     # JWT
     JWT_SECRET_KEY: str
     JWT_ALGORITHM: str = "HS256"

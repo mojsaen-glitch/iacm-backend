@@ -240,9 +240,22 @@ async def recovery_options(flight_id: str, current_user: CurrentUser, sb: SbClie
 
     available_crew = [c for c in crew_rows if c["id"] not in assigned_ids]
 
-    # Rank: prefer crew with lowest monthly_flight_hours (fairness)
+    # Fairness rank: lowest REAL credited month hours first (one batch join —
+    # same engine policy as the Monthly Hours matrix, cancelled excluded). The
+    # stored crew.monthly_flight_hours is NOT maintained (usually 0 for
+    # everyone) and stays only as a fallback if the batch computation fails.
+    real_hours: dict = {}
+    try:
+        from app.core.monthly_hours import month_hours_by_crew
+        real_hours = month_hours_by_crew(sb, company_id)
+    except Exception:
+        log.exception("month-hours batch failed — ranking falls back to stored field")
+    for c in available_crew:
+        c["computed_month_hours"] = (
+            real_hours.get(c["id"], 0.0) if real_hours
+            else float(c.get("monthly_flight_hours") or 0))
     available_crew.sort(key=lambda c: (
-        float(c.get("monthly_flight_hours") or 0),
+        float(c.get("computed_month_hours") or 0),
         float(c.get("total_flight_hours")   or 0),
     ))
 

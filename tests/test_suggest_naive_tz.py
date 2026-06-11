@@ -15,6 +15,9 @@ class _Q:
     def select(self, *a, **k): return self
     def eq(self, *a, **k): return self
     def in_(self, *a, **k): return self
+    def order(self, *a, **k): return self
+    def range(self, *a, **k): return self
+    def limit(self, *a, **k): return self
     def execute(self):
         return type("R", (), {"data": list(self.store.get(self.name, []))})()
 

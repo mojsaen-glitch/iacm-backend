@@ -30,6 +30,7 @@ from app.api.v1.endpoints import (
     developer,
     developer_actions,
     developer_vercel,
+    occ,
 )
 
 api_router = APIRouter()
@@ -64,3 +65,4 @@ api_router.include_router(admin_control.router)
 api_router.include_router(developer.router)
 api_router.include_router(developer_actions.router)
 api_router.include_router(developer_vercel.router)
+api_router.include_router(occ.router)

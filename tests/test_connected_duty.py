@@ -131,3 +131,33 @@ def test_om_clause_number_on_violation():
     fdp = [i for i in res["issues"] if i["rule"] == "fdp_exceeded"][0]
     assert fdp["om_ref"] == "OM-C 7.2"
     assert fdp["message_ar"].startswith("OM-C 7.2:")
+
+
+# 8. FDC #3: batch_connected_duty must produce the SAME result as
+# check_connected_duty for every crew (no behavioural divergence), in a fraction
+# of the queries. Two crew: one clean, one with expired training.
+def test_batch_matches_single_per_crew():
+    tables = {
+        "crew": [_crew(id="c1", full_name_en="One"), _crew(id="c2", full_name_en="Two")],
+        "flights": _round_trip(),
+        "assignments": [],
+        "documents": [],
+        "training_records": [{"crew_id": "c2", "training_type": "recurrent",
+                              "expiry_date": "2020-01-01"}],
+        "fdp_rules": [_fdp_rule(780)],
+        "om_articles": [],
+    }
+    batch = {r["crew_id"]: r
+             for r in ComplianceEngine(FakeSb(tables)).batch_connected_duty(["c1", "c2"], IDS)}
+    for cid in ("c1", "c2"):
+        single = ComplianceEngine(FakeSb(tables)).check_connected_duty(cid, IDS)
+        b = batch[cid]
+        assert b["status"] == single["status"], cid
+        assert sorted(i["rule"] for i in b["issues"]) == \
+               sorted(i["rule"] for i in single["issues"]), cid
+        assert sorted(b["blocking_reasons"]) == sorted(single["blocking_reasons"]), cid
+        assert b["duty"]["sectors"] == single["duty"]["sectors"]
+    # The clean crew passes; the expired-training crew is blocked.
+    assert batch["c1"]["status"] != ComplianceStatus.BLOCKED
+    assert batch["c2"]["status"] == ComplianceStatus.BLOCKED
+    assert any(i["rule"].startswith("training_expired") for i in batch["c2"]["issues"])

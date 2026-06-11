@@ -6,9 +6,11 @@ import io
 import openpyxl
 import pytest
 
+from datetime import datetime, timezone
+
 from app.core.monthly_hours import (
     build_matrix, build_statement, hm, _credited_hours, _crew_type_of,
-    invalidate_matrix_cache,
+    invalidate_matrix_cache, crew_flight_hours, month_hours_by_crew,
 )
 from app.core.monthly_hours_excel import build_workbook, build_statement_workbook
 
@@ -33,6 +35,32 @@ class _Query:
         self._in = None
         self._range = None
         self._eq = []
+        self._neq = []
+        self._gte = []
+        self._lt = []
+
+    @staticmethod
+    def _get(row, field):
+        """Resolve 'a.b' join paths into embedded dicts (PostgREST-style)."""
+        cur = row
+        for part in field.split("."):
+            if not isinstance(cur, dict):
+                return None
+            cur = cur.get(part)
+        return cur
+
+    @staticmethod
+    def _cmp_key(v):
+        """Timestamps compare as INSTANTS (mixed +03:00 / Z offsets, like real
+        Postgres); anything non-temporal falls back to string compare."""
+        from datetime import datetime as _dt, timezone as _tz
+        try:
+            t = _dt.fromisoformat(str(v).replace("Z", "+00:00"))
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=_tz.utc)
+            return t.timestamp()
+        except (ValueError, TypeError):
+            return str(v)
 
     def select(self, *_a, **_k):
         return self
@@ -41,13 +69,19 @@ class _Query:
         self._eq.append((field, value))
         return self
 
+    def neq(self, field, value):
+        self._neq.append((field, value))
+        return self
+
     def order(self, *_a, **_k):
         return self
 
-    def gte(self, *_a, **_k):
+    def gte(self, field, value):
+        self._gte.append((field, value))
         return self
 
-    def lt(self, *_a, **_k):
+    def lt(self, field, value):
+        self._lt.append((field, value))
         return self
 
     def limit(self, *_a, **_k):
@@ -64,7 +98,15 @@ class _Query:
     def execute(self):
         data = list(self._store.get(self._table, []))
         for f, v in self._eq:
-            data = [d for d in data if d.get(f) == v]
+            data = [d for d in data if self._get(d, f) == v]
+        for f, v in self._neq:
+            data = [d for d in data if self._get(d, f) != v]
+        for f, v in self._gte:
+            data = [d for d in data
+                    if self._cmp_key(self._get(d, f) or "") >= self._cmp_key(v)]
+        for f, v in self._lt:
+            data = [d for d in data
+                    if self._cmp_key(self._get(d, f) or "") < self._cmp_key(v)]
         if self._in:
             f, vals = self._in
             data = [d for d in data if d.get(f) in vals]
@@ -167,6 +209,185 @@ def test_build_matrix_aggregates():
     assert s["total_hours"] == 7.5
 
     assert any(b["crew_id"] == "c3" for b in m["blocked"])
+
+
+def test_cancelled_flight_not_credited():
+    """A CANCELLED flight must neither credit hours nor appear as a duty cell —
+    engine-level exclusion (matrix + Excel + crew profile all agree)."""
+    store = _store()
+    # 2h operating leg (counts) + 5h CANCELLED leg (must NOT count) for c1.
+    store["flights"] += [
+        {"id": "f_ok", "flight_number": "IA103", "origin_code": "BGW",
+         "destination_code": "EBL", "company_id": "co1",
+         "departure_time": "2025-08-10T08:00:00+00:00",
+         "arrival_time": "2025-08-10T10:00:00+00:00",
+         "duration_hours": 2.0, "aircraft_type": "B737", "aircraft_id": "a1"},
+        {"id": "f_cx", "flight_number": "IA104", "origin_code": "BGW",
+         "destination_code": "AMM", "company_id": "co1", "status": "cancelled",
+         "departure_time": "2025-08-11T08:00:00+00:00",
+         "arrival_time": "2025-08-11T13:00:00+00:00",
+         "duration_hours": 5.0, "aircraft_type": "B737", "aircraft_id": "a1"},
+    ]
+    store["assignments"] += [
+        {"id": "a_ok", "crew_id": "c1", "flight_id": "f_ok", "duty_type": "operating"},
+        {"id": "a_cx", "crew_id": "c1", "flight_id": "f_cx", "duty_type": "operating"},
+    ]
+    invalidate_matrix_cache()
+    m = build_matrix(FakeSb(store), "co1", 2025, 8, {})
+    cap = {r["crew_id"]: r for r in m["rows"]}["c1"]
+    assert cap["month_total"] == 9.5          # 3.0 + 4.5 + 2.0 — NOT the 5h cancelled
+    assert "11" not in cap["days"]            # cancelled leg leaves no duty cell
+    # Deadhead policy unchanged: c2 still credits nothing.
+    assert {r["crew_id"]: r for r in m["rows"]}["c2"]["month_total"] == 0.0
+
+
+def test_crew_profile_excludes_cancelled_too():
+    """GET /crew/{id}/flight-hours path (crew_flight_hours) — same engine rule."""
+    store = _store()
+    store["flights"].append(
+        {"id": "f_cx", "flight_number": "IA104", "origin_code": "BGW",
+         "destination_code": "AMM", "company_id": "co1", "status": "cancelled",
+         "departure_time": "2025-08-11T08:00:00+00:00",
+         "arrival_time": "2025-08-11T13:00:00+00:00",
+         "duration_hours": 5.0, "aircraft_type": "B737", "aircraft_id": "a1"})
+    store["assignments"].append(
+        {"id": "a_cx", "crew_id": "c1", "flight_id": "f_cx", "duty_type": "operating"})
+    res = crew_flight_hours(FakeSb(store), "co1", "c1")
+    assert res["total"] == 7.5                # 3.0 + 4.5 — cancelled 5h excluded
+    # Deadhead-only crew stays at zero (policy untouched).
+    assert crew_flight_hours(FakeSb(store), "co1", "c2")["total"] == 0.0
+
+
+# ── Baghdad month bounds (official reports) ───────────────────────────────────
+def _boundary_store():
+    """Crew fixture + a red-eye departing 2026-06-30T22:00Z = 01:00 JULY 1
+    Baghdad — must belong to JULY, day cell '1'."""
+    s = _store()
+    s["flights"] = [
+        # 01:00 Jul 1 Baghdad (22:00Z Jun 30) → JULY, day 1
+        {"id": "fb", "flight_number": "IA201", "origin_code": "BGW",
+         "destination_code": "IST", "company_id": "co1",
+         "departure_time": "2026-06-30T22:00:00+00:00",
+         "arrival_time": "2026-07-01T01:00:00+00:00",
+         "duration_hours": 2.0, "aircraft_type": "B737", "aircraft_id": "a1"},
+        # same boundary instant but CANCELLED → never credited
+        {"id": "fbx", "flight_number": "IA202", "origin_code": "BGW",
+         "destination_code": "AMM", "company_id": "co1", "status": "cancelled",
+         "departure_time": "2026-06-30T22:30:00+00:00",
+         "arrival_time": "2026-07-01T02:30:00+00:00",
+         "duration_hours": 5.0, "aircraft_type": "B737", "aircraft_id": "a1"},
+        # 21:00 Jul 31 Baghdad (18:00Z) → stays in JULY, day 31
+        {"id": "fl", "flight_number": "IA203", "origin_code": "BGW",
+         "destination_code": "EBL", "company_id": "co1",
+         "departure_time": "2026-07-31T18:00:00+00:00",
+         "arrival_time": "2026-07-31T19:30:00+00:00",
+         "duration_hours": 1.5, "aircraft_type": "B737", "aircraft_id": "a1"},
+    ]
+    s["assignments"] = [
+        {"id": "ab", "crew_id": "c1", "flight_id": "fb", "duty_type": "operating"},
+        {"id": "abx", "crew_id": "c1", "flight_id": "fbx", "duty_type": "operating"},
+        {"id": "al", "crew_id": "c1", "flight_id": "fl", "duty_type": "operating"},
+        {"id": "ad", "crew_id": "c2", "flight_id": "fb", "duty_type": "deadhead"},
+    ]
+    return s
+
+
+def test_baghdad_boundary_flight_counts_in_july_not_june():
+    store = _boundary_store()
+    invalidate_matrix_cache()
+    july = build_matrix(FakeSb(store), "co1", 2026, 7, {})
+    cap = {r["crew_id"]: r for r in july["rows"]}["c1"]
+    assert cap["month_total"] == 3.5            # 2.0 (red-eye) + 1.5 (last day)
+    assert "1" in cap["days"]                   # Baghdad day cell, NOT June 30
+    assert "31" in cap["days"]                  # last-day flight stays in July
+    # Cancelled boundary leg neither credits nor appears.
+    assert all(l["flight_no"] != "IA202"
+               for d in cap["days"].values() for l in d["legs"])
+    # Deadhead on the boundary still credits nothing.
+    assert {r["crew_id"]: r for r in july["rows"]}["c2"]["month_total"] == 0.0
+
+    june = build_matrix(FakeSb(store), "co1", 2026, 6, {})
+    june_rows = {r["crew_id"]: r for r in june["rows"]}
+    assert june_rows.get("c1") is None or june_rows["c1"]["month_total"] == 0.0
+
+
+def test_baghdad_profile_matches_matrix():
+    """crew_flight_hours (the profile) buckets the CURRENT Baghdad month the
+    same way the matrix does — boundary flight included in both."""
+    from datetime import timedelta
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    bag_now = now + timedelta(hours=3)
+    month_start_utc = bag_now.replace(day=1, hour=0, minute=0,
+                                      second=0, microsecond=0) - timedelta(hours=3)
+    dep_in = (month_start_utc + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    dep_out = (month_start_utc - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    store = _store()
+    store["flights"] = [
+        {"id": "fin", "flight_number": "IA301", "origin_code": "BGW",
+         "destination_code": "IST", "company_id": "co1",
+         "departure_time": dep_in, "arrival_time": dep_in,
+         "duration_hours": 2.0, "aircraft_type": "B737", "aircraft_id": "a1"},
+        {"id": "fout", "flight_number": "IA302", "origin_code": "BGW",
+         "destination_code": "EBL", "company_id": "co1",
+         "departure_time": dep_out, "arrival_time": dep_out,
+         "duration_hours": 7.0, "aircraft_type": "B737", "aircraft_id": "a1"},
+    ]
+    store["assignments"] = [
+        {"id": "ain", "crew_id": "c1", "flight_id": "fin", "duty_type": "operating"},
+        {"id": "aout", "crew_id": "c1", "flight_id": "fout", "duty_type": "operating"},
+    ]
+    profile = crew_flight_hours(FakeSb(store), "co1", "c1")
+    assert profile["month"] == 2.0              # only the in-month boundary leg
+    invalidate_matrix_cache()
+    m = build_matrix(FakeSb(store), "co1", bag_now.year, bag_now.month, {})
+    cap = {r["crew_id"]: r for r in m["rows"]}["c1"]
+    assert cap["month_total"] == profile["month"]   # matrix == profile
+
+
+def test_month_hours_by_crew_baghdad_boundary():
+    from datetime import timedelta
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    bag_now = now + timedelta(hours=3)
+    month_start_utc = bag_now.replace(day=1, hour=0, minute=0,
+                                      second=0, microsecond=0) - timedelta(hours=3)
+    dep_in = (month_start_utc + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    dep_out = (month_start_utc - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    store = {"assignments": [
+        {"crew_id": "c1", "duty_type": "operating",
+         "flights": {"duration_hours": 2.0, "departure_time": dep_in,
+                     "status": "scheduled", "company_id": "co1"}},
+        {"crew_id": "c1", "duty_type": "operating",
+         "flights": {"duration_hours": 7.0, "departure_time": dep_out,
+                     "status": "scheduled", "company_id": "co1"}},
+    ]}
+    out = month_hours_by_crew(FakeSb(store), "co1")
+    assert out.get("c1") == 2.0                 # previous-Baghdad-month leg excluded
+
+
+def test_month_hours_by_crew_batch():
+    """The IROPS-fairness batch: real credited hours per crew in one join —
+    same policy (operating full, deadhead 0, cancelled excluded)."""
+    now = datetime.now(timezone.utc)
+    this_month = now.replace(day=2).strftime("%Y-%m-%dT08:00:00+00:00")
+    store = {
+        "assignments": [
+            # operating 3h this month → credits
+            {"crew_id": "c1", "duty_type": "operating",
+             "flights": {"duration_hours": 3.0, "departure_time": this_month,
+                         "status": "scheduled", "company_id": "co1"}},
+            # CANCELLED 5h → must NOT credit
+            {"crew_id": "c1", "duty_type": "operating",
+             "flights": {"duration_hours": 5.0, "departure_time": this_month,
+                         "status": "cancelled", "company_id": "co1"}},
+            # deadhead 4h → policy unchanged: 0
+            {"crew_id": "c2", "duty_type": "deadhead",
+             "flights": {"duration_hours": 4.0, "departure_time": this_month,
+                         "status": "scheduled", "company_id": "co1"}},
+        ],
+    }
+    out = month_hours_by_crew(FakeSb(store), "co1")
+    assert out.get("c1") == 3.0          # not 8.0 — cancelled excluded
+    assert out.get("c2", 0.0) == 0.0     # deadhead still credits nothing
 
 
 def test_only_with_hours_filter():

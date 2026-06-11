@@ -11,5 +11,11 @@
       "src": "/(.*)",
       "dest": "api/index.py"
     }
+  ],
+  "crons": [
+    {
+      "path": "/api/v1/documents/cron/expiry-reminders",
+      "schedule": "0 6 * * *"
+    }
   ]
 }

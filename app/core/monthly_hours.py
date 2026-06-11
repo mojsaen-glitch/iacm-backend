@@ -15,13 +15,27 @@ from __future__ import annotations
 import calendar
 import time
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from app.core.crew_roles import role_category, role_code, CAT_FLIGHT_DECK, CAT_CABIN
 from app.core.exceptions import NotFoundError
 
 # Every credited hour is traceable back to this source column.
 HOURS_SOURCE = "flights.duration_hours"
+
+# Official monthly reports follow the BAGHDAD calendar (+03:00), not UTC — a
+# red-eye departing 01:00 Baghdad on the 1st belongs to the NEW month. This is
+# REPORTS-ONLY: compliance/FTL keeps its own independent windows untouched.
+_BAGHDAD = timedelta(hours=3)
+
+
+def _month_bounds_baghdad(year: int, month: int) -> tuple[str, str]:
+    """[start, end) of the BAGHDAD calendar month as ISO strings with an
+    explicit +03:00 offset — PostgREST compares timestamptz across offsets
+    correctly, so the DB window itself follows the Baghdad month."""
+    end_year, end_month = (year + 1, 1) if month == 12 else (year, month + 1)
+    return (f"{year:04d}-{month:02d}-01T00:00:00+03:00",
+            f"{end_year:04d}-{end_month:02d}-01T00:00:00+03:00")
 
 # ── build_matrix result cache (per process / warm serverless instance) ───────
 # The matrix is read repeatedly with the same params (matrix page + analytics +
@@ -118,6 +132,125 @@ def _chunks(seq, size):
         yield seq[i:i + size]
 
 
+def _as_naive_utc(dt: datetime) -> datetime:
+    """Normalize a (possibly tz-aware) datetime to naive UTC for safe comparison."""
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def crew_flight_hours(sb, company_id: str, crew_id: str, dh_credit=None) -> dict:
+    """Per-crew credited flight hours bucketed by period — month / last 28 days /
+    year / total — using the SAME crediting policy as the matrix (operating full,
+    deadhead × dh_factor) so the figures line up with the Monthly Hours report.
+
+    Crew-scoped (only this member's assignments + their flights), so it stays cheap
+    enough to call from the crew profile.
+    """
+    dh_factor = _dh_factor(dh_credit)
+
+    asgs = _fetch_all(lambda: sb.table("assignments")
+                      .select("flight_id, duty_type").eq("crew_id", crew_id))
+    flight_ids = list({a.get("flight_id") for a in asgs if a.get("flight_id")})
+
+    flight_by_id: dict[str, dict] = {}
+    for chunk in _chunks(flight_ids, 100):
+        # Cancelled flights never credit hours — excluded at the ENGINE level so
+        # every consumer (matrix / Excel / crew profile) agrees.
+        for f in _fetch_all(lambda ch=chunk: sb.table("flights")
+                            .select("id, departure_time, duration_hours")
+                            .eq("company_id", company_id)
+                            .neq("status", "cancelled").in_("id", ch)):
+            flight_by_id[f["id"]] = f
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    bag_now = now + _BAGHDAD
+    # Month/year buckets follow the BAGHDAD calendar: compute the boundary on
+    # the Baghdad wall clock, then shift back to naive-UTC for comparison
+    # against the (naive-UTC) departure instants. last-28-days stays rolling.
+    month_start = bag_now.replace(day=1, hour=0, minute=0,
+                                  second=0, microsecond=0) - _BAGHDAD
+    year_start = bag_now.replace(month=1, day=1, hour=0, minute=0,
+                                 second=0, microsecond=0) - _BAGHDAD
+    last28 = now - timedelta(days=28)
+
+    # Last 6 calendar months (oldest → newest) for the profile trend chart.
+    pairs: list[tuple[int, int]] = []
+    y, m = bag_now.year, bag_now.month
+    for _ in range(6):
+        pairs.append((y, m))
+        m -= 1
+        if m == 0:
+            m, y = 12, y - 1
+    pairs.reverse()
+    series_bucket = {p: 0.0 for p in pairs}
+
+    total = year = last_28 = month = 0.0
+    for a in asgs:
+        f = flight_by_id.get(a.get("flight_id"))
+        if not f:
+            continue
+        dt = _parse_dt(f.get("departure_time"))
+        if dt is None:
+            continue
+        dt = _as_naive_utc(dt)
+        credited = _credited_hours(a.get("duty_type") or "operating",
+                                   float(f.get("duration_hours") or 0), dh_factor)
+        if credited <= 0:
+            continue
+        total += credited
+        if dt >= year_start:
+            year += credited
+        if dt >= last28:
+            last_28 += credited
+        if dt >= month_start:
+            month += credited
+        dtb = dt + _BAGHDAD            # series bucket = BAGHDAD calendar month
+        key = (dtb.year, dtb.month)
+        if key in series_bucket:
+            series_bucket[key] += credited
+
+    series = [{"year": yy, "month": mm, "hours": round(series_bucket[(yy, mm)], 2)}
+              for (yy, mm) in pairs]
+
+    return {
+        "month": round(month, 2),
+        "last_28_days": round(last_28, 2),
+        "year": round(year, 2),
+        "total": round(total, 2),
+        "series": series,
+    }
+
+
+def month_hours_by_crew(sb, company_id: str, dh_credit=None) -> dict[str, float]:
+    """Current-month CREDITED hours per crew for the whole company in ONE paged
+    join query — for rankers (e.g. IROPS fairness) that must never loop a
+    per-crew call. Same engine policy as the matrix: ``_credited_hours`` +
+    cancelled flights excluded. Crew with no credited month hours are absent
+    (treat missing as 0.0)."""
+    dh = _dh_factor(dh_credit)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    # Baghdad month boundary, expressed as naive-UTC for the DB comparison.
+    month_start = (now + _BAGHDAD).replace(day=1, hour=0, minute=0,
+                                           second=0, microsecond=0) - _BAGHDAD
+    rows = _fetch_all(lambda: sb.table("assignments")
+                      .select("crew_id, duty_type, "
+                              "flights!inner(duration_hours, departure_time, status)")
+                      .eq("flights.company_id", company_id)
+                      .neq("flights.status", "cancelled")
+                      .gte("flights.departure_time", month_start.isoformat()))
+    out: dict[str, float] = {}
+    for r in rows:
+        cid = r.get("crew_id")
+        f = r.get("flights") or {}
+        if not cid or not f:
+            continue
+        out[cid] = out.get(cid, 0.0) + _credited_hours(
+            r.get("duty_type") or "operating",
+            float(f.get("duration_hours") or 0), dh)
+    return {k: round(v, 2) for k, v in out.items()}
+
+
 def _crew_code(c: dict) -> str:
     return (c.get("roster_name") or c.get("nickname") or c.get("employee_id") or "").strip()
 
@@ -146,12 +279,8 @@ def build_matrix(sb, company_id: str, year: int, month: int, filters: dict | Non
         return _cached
     dh_factor = _dh_factor(filters.get("dh_credit"))
     days_in_month = calendar.monthrange(year, month)[1]
-    start = f"{year:04d}-{month:02d}-01T00:00:00+00:00"
-    end_month = month + 1
-    end_year = year
-    if end_month > 12:
-        end_month, end_year = 1, year + 1
-    end = f"{end_year:04d}-{end_month:02d}-01T00:00:00+00:00"
+    start, end = _month_bounds_baghdad(year, month)
+    end_month, end_year = (1, year + 1) if month == 12 else (month + 1, year)
 
     # ── Reference data ──────────────────────────────────────────────────────
     crew_rows = _fetch_all(lambda: sb.table("crew").select(
@@ -160,10 +289,13 @@ def build_matrix(sb, company_id: str, year: int, month: int, filters: dict | Non
     ).eq("company_id", company_id))
     crew_by_id = {c["id"]: c for c in crew_rows}
 
+    # Cancelled flights are excluded at the ENGINE level — they neither credit
+    # hours nor appear as duty cells (matrix + Excel + analytics stay agreed).
     flights = _fetch_all(lambda: sb.table("flights").select(
         "id, flight_number, origin_code, destination_code, departure_time, "
         "arrival_time, duration_hours, aircraft_type, aircraft_id"
-    ).eq("company_id", company_id).gte("departure_time", start).lt("departure_time", end))
+    ).eq("company_id", company_id).neq("status", "cancelled")
+     .gte("departure_time", start).lt("departure_time", end))
     flight_by_id = {f["id"]: f for f in flights}
 
     aircraft = _fetch_all(lambda: sb.table("aircraft").select("id, registration")
@@ -212,7 +344,7 @@ def build_matrix(sb, company_id: str, year: int, month: int, filters: dict | Non
         dt = _parse_dt(f.get("departure_time"))
         if dt is None:
             continue
-        day = dt.day
+        day = (dt + _BAGHDAD).day      # day cell follows the BAGHDAD calendar
         sta = _parse_dt(f.get("arrival_time"))
         duty = a.get("duty_type") or "operating"
         duration = float(f.get("duration_hours") or 0)
@@ -513,9 +645,8 @@ def build_statement(sb, company_id: str, crew_id: str, year: int, month: int,
     the same `_credited_hours` policy as the matrix, so totals match exactly."""
     dh_factor = _dh_factor(dh_credit)
     days_in_month = calendar.monthrange(year, month)[1]
-    start = f"{year:04d}-{month:02d}-01T00:00:00+00:00"
+    start, end = _month_bounds_baghdad(year, month)
     end_month, end_year = (1, year + 1) if month == 12 else (month + 1, year)
-    end = f"{end_year:04d}-{end_month:02d}-01T00:00:00+00:00"
     start_date = f"{year:04d}-{month:02d}-01"
     end_date = f"{end_year:04d}-{end_month:02d}-01"
 
@@ -531,11 +662,13 @@ def build_statement(sb, company_id: str, crew_id: str, year: int, month: int,
     flight_ids = list({a.get("flight_id") for a in asgs if a.get("flight_id")})
     flights: list[dict] = []
     for chunk in _chunks(flight_ids, 100):
+        # Same engine-level rule: cancelled flights never credit hours.
         flights.extend(_fetch_all(
             lambda ch=chunk: sb.table("flights").select(
                 "id, flight_number, origin_code, destination_code, departure_time, "
                 "arrival_time, duration_hours, aircraft_type, aircraft_id")
-            .eq("company_id", company_id).gte("departure_time", start)
+            .eq("company_id", company_id).neq("status", "cancelled")
+            .gte("departure_time", start)
             .lt("departure_time", end).in_("id", ch)))
     flight_by_id = {f["id"]: f for f in flights}
     aircraft = _fetch_all(lambda: sb.table("aircraft").select("id, registration")
@@ -560,7 +693,7 @@ def build_statement(sb, company_id: str, crew_id: str, year: int, month: int,
         duty = a.get("duty_type") or "operating"
         duration = float(f.get("duration_hours") or 0)
         included, credited, reason, incomplete = _inclusion(duty, duration, dh_factor)
-        day = dt.day
+        day = (dt + _BAGHDAD).day      # day cell follows the BAGHDAD calendar
         legs.append({
             "date": f"{year:04d}-{month:02d}-{day:02d}", "day": day,
             "flight_no": f.get("flight_number") or "",

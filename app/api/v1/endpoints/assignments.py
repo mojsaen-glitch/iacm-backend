@@ -1,4 +1,6 @@
 import uuid
+import time
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Optional
@@ -262,7 +264,8 @@ async def get_assignments(
     crew_id: Optional[str] = Query(None),
     from_date: Optional[str] = Query(None),
     to_date: Optional[str] = Query(None),
-    page_size: int = Query(100),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=1, le=1000),
 ):
     """Get assignments filtered by flight_id or crew_id with optional date range.
 
@@ -282,9 +285,22 @@ async def get_assignments(
     # they passed. For ops staff, honour the optional filter.
     if forced_crew_id is not None:
         q = q.eq("crew_id", forced_crew_id)
+        # Crew see their duty ONLY once the flight is published — a draft roster
+        # under construction by the schedulers must not leak to crew accounts.
+        q = q.eq("flights.publish_status", "published")
     elif crew_id:
         q = q.eq("crew_id", crew_id)
-    result = q.limit(page_size).execute()
+    # Date window — pushed down to the DB via the flights join so a windowed
+    # caller (the scheduling timeline) pages over DAYS, not the whole history.
+    # The python-side re-check below stays as a guard.
+    if from_date:
+        q = q.gte("flights.departure_time", from_date)
+    if to_date:
+        q = q.lte("flights.departure_time", f"{to_date}T23:59:59")
+    # Real offset pagination (stable order) so the client can page through ALL
+    # assignments instead of being silently capped at one page.
+    skip = (page - 1) * page_size
+    result = q.order("id").range(skip, skip + page_size - 1).execute()
     rows = result.data or []
     if not rows:
         return []
@@ -400,16 +416,28 @@ async def get_flight_roster(flight_id: str, current_user: CurrentUser, sb: SbCli
     if rows:
         crew_ids = list({r["crew_id"] for r in rows if r.get("crew_id")})
         crew_map = {c["id"]: c for c in (sb.table("crew")
-            .select("id, full_name_ar, full_name_en, rank")
+            .select("id, full_name_ar, full_name_en, rank, operator_company_id")
             .in_("id", crew_ids).execute().data or [])}
         acct_ids = {u["crew_id"] for u in (sb.table("users")
             .select("crew_id").in_("crew_id", crew_ids).eq("is_active", True)
             .execute().data or []) if u.get("crew_id")}
+        # Operator-airline names (id → ar/en) so the UI can show each crew's airline.
+        company_name: dict = {}
+        try:
+            for co in (sb.table("companies").select("id, name_ar, name_en").execute().data or []):
+                company_name[co["id"]] = (co.get("name_ar") or co.get("name_en") or "",
+                                          co.get("name_en") or co.get("name_ar") or "")
+        except Exception:
+            company_name = {}
 
         for r in rows:
             c = crew_map.get(r.get("crew_id"), {})
             rank = r.get("assigned_role") or c.get("rank", "")
             duty = (r.get("duty_type") or _OPERATING).lower()
+            # Operator airline: prefer the assignment snapshot, fall back to the
+            # crew's current airline (covers assignments made before snapshots).
+            op_id = r.get("operator_company_id") or c.get("operator_company_id")
+            op_names = company_name.get(op_id, ("", ""))
             entry = {
                 "assignment_id": r.get("id"),
                 "crew_id":       r.get("crew_id"),
@@ -418,6 +446,9 @@ async def get_flight_roster(flight_id: str, current_user: CurrentUser, sb: SbCli
                 "rank":          rank,
                 "duty_type":     duty,
                 "has_account":   r.get("crew_id") in acct_ids,
+                "operator_company_id": op_id,
+                "operator_company_ar": op_names[0],
+                "operator_company_en": op_names[1],
             }
             # Non-operating rows go to their own block ONLY — they never appear
             # in the GenDec sections, so the per-role counter stays clean.
@@ -763,6 +794,8 @@ async def assign_crew(data: dict, current_user: CurrentUser, sb: SbClient):
                 "crew_name":       crew.get("full_name_ar") or crew.get("full_name_en"),
                 "risk_level":      risk_level if is_override else None,
                 "assignment_type": assignment.get("assignment_type"),
+                # New assignments await the crew member's explicit acceptance.
+                "acceptance_status": "pending_acceptance",
             }, ensure_ascii=False),
             "company_id":      current_user["company_id"],
             "created_at":      datetime.now(timezone.utc).isoformat(),
@@ -781,6 +814,15 @@ async def assign_crew(data: dict, current_user: CurrentUser, sb: SbClient):
             _notify_crew_assigned(sb, crew_id, flight)
         except Exception:
             logger.exception("assign_crew notify failed crew=%s flight=%s", crew_id, flight_id)
+
+    # If this flight's roster was already finalised, its GD is now out of date —
+    # flag it stale + alert Flight Ops. Lazy import avoids a circular dependency
+    # (flights.py imports _notify_crew_assigned from this module). Best-effort.
+    try:
+        from app.api.v1.endpoints.flights import mark_gd_stale_if_finalized
+        mark_gd_stale_if_finalized(sb, current_user["company_id"], flight_id, actor=current_user)
+    except Exception:
+        logger.exception("GD stale-mark failed (assign) flight=%s", flight_id)
 
     return saved
 
@@ -875,7 +917,14 @@ async def assign_connected_duty(data: dict, current_user: CurrentUser, sb: SbCli
                     )
 
     engine = ComplianceEngine(sb)
-    previews = [engine.check_connected_duty(cid, flight_ids) for cid in crew_ids]
+    # BATCHED compliance: one preload + per-crew evaluation in memory, instead of
+    # running the full engine N× (which timed out on multi-crew duties). Same
+    # rules + same per-crew result shape as check_connected_duty.
+    _t0 = time.perf_counter()
+    previews = engine.batch_connected_duty(crew_ids, flight_ids)
+    logger.info(
+        "connected-duty compliance: crew=%d sectors=%d check=%.0fms",
+        len(crew_ids), len(flight_ids), (time.perf_counter() - _t0) * 1000)
 
     # Preview mode → compliance only, no writes.
     if preview:
@@ -918,6 +967,7 @@ async def assign_connected_duty(data: dict, current_user: CurrentUser, sb: SbCli
     for r in (sb.table("assignments").select("flight_id,crew_id")
               .in_("flight_id", flight_ids).in_("crew_id", crew_ids).execute().data or []):
         _existing_pairs.add((r.get("flight_id"), r.get("crew_id")))
+    _t_ins = time.perf_counter()
     try:
         for cid in crew_ids:
             for fid in flight_ids:
@@ -944,22 +994,41 @@ async def assign_connected_duty(data: dict, current_user: CurrentUser, sb: SbCli
                 logger.exception("rollback failed for assignment %s", aid)
         logger.exception("connected-duty assign failed")
         raise HTTPException(status_code=502, detail=f"assignment failed, rolled back: {str(e)[:200]}")
+    logger.info("connected-duty insert: rows=%d in %.0fms",
+                len(inserted_ids), (time.perf_counter() - _t_ins) * 1000)
 
-    # Audit the duty action.
+    # Audit the duty action. (Was written to a non-existent `audit_logs` table
+    # with a mismatched schema → every connected-duty silently left NO trail.)
     try:
-        sb.table("audit_logs").insert({
-            "id": str(uuid.uuid4()),
+        sb.table("audit_log").insert({
             "user_id": current_user["id"],
-            "company_id": current_user["company_id"],
+            "user_name": current_user.get("name_ar") or current_user.get("name_en")
+                         or current_user.get("email", ""),
             "action": "assign_connected_duty",
-            "is_override": is_override,
-            "override_reason": override_reason or None,
-            "details": {"flight_ids": flight_ids, "crew_member_ids": crew_ids,
-                        "notes": data.get("notes")},
+            "entity_type": "assignment",
+            "entity_id": flight_ids[0] if flight_ids else "",
+            "company_id": current_user["company_id"],
             "created_at": now,
+            "after_data": json.dumps({
+                "flight_ids": flight_ids,
+                "crew_member_ids": crew_ids,
+                "is_override": is_override,
+                "override_reason": override_reason or None,
+                "notes": data.get("notes"),
+            }, ensure_ascii=False),
         }).execute()
     except Exception:
         logger.warning("connected-duty audit log skipped")
+
+    # Any finalised sector in this duty now has an out-of-date GD → mark stale +
+    # alert Flight Ops, once per affected flight. Best-effort.
+    if inserted_ids:
+        try:
+            from app.api.v1.endpoints.flights import mark_gd_stale_if_finalized
+            for fid in flight_ids:
+                mark_gd_stale_if_finalized(sb, current_user["company_id"], fid, actor=current_user)
+        except Exception:
+            logger.exception("GD stale-mark failed (connected-duty)")
 
     return {"assigned": len(inserted_ids), "crews": len(crew_ids),
             "flights": len(flight_ids), "is_override": is_override,
@@ -1008,10 +1077,22 @@ async def suggest_crew(
     # flights). Requesting a non-existent column makes PostgREST reject the whole
     # SELECT (APIError → 500). Select only columns that exist; the qualification
     # check below falls back to aircraft_qualifications when aircraft_type is absent.
-    crew_rows = sb.table("crew").select(
-        "id,status,rank,aircraft_qualifications,"
-        "employee_id,full_name_ar,full_name_en,base"
-    ).eq("company_id", cid).execute().data or []
+    # Page through ALL crew (a single PostgREST select silently caps at 1000
+    # rows) so the ranking considers the whole roster, not a first-1000 slice.
+    crew_rows: list[dict] = []
+    _cp = 0
+    while True:
+        _chunk = (sb.table("crew").select(
+            "id,status,rank,aircraft_qualifications,max_monthly_hours,"
+            "employee_id,full_name_ar,full_name_en,base"
+        ).eq("company_id", cid).order("id")
+            .range(_cp * 1000, _cp * 1000 + 999).execute().data or [])
+        crew_rows.extend(_chunk)
+        if len(_chunk) < 1000:
+            break
+        _cp += 1
+        if _cp > 30:   # safety cap: 30k crew
+            break
     # A specialty scheduler only ever sees/suggests their own ranks.
     restricted = _restricted_ranks(current_user)
     if restricted is not None:
@@ -1020,17 +1101,19 @@ async def suggest_crew(
 
     # Batch-load assignments for THIS company's crew + their flights once
     # (scoped — avoids fetching every company's assignments and per-crew queries).
-    asgs = []
-    if crew_ids:
-        asgs = sb.table("assignments").select("crew_id,flight_id") \
-            .in_("crew_id", crew_ids).execute().data or []
+    # Chunk the IN() filters (PostgREST caps the list length + the 1000-row
+    # result) so large rosters don't truncate the pre-filter data.
+    asgs: list[dict] = []
+    for i in range(0, len(crew_ids), 500):
+        asgs.extend(sb.table("assignments").select("crew_id,flight_id")
+                    .in_("crew_id", crew_ids[i:i + 500]).execute().data or [])
     fids = list({a["flight_id"] for a in asgs if a.get("flight_id")})
     fmap = {}
-    if fids:
-        frows = sb.table("flights").select(
-            "id,departure_time,arrival_time,duration_hours,status"
-        ).in_("id", fids).execute().data or []
-        fmap = {f["id"]: f for f in frows}
+    for i in range(0, len(fids), 500):
+        for f in (sb.table("flights").select(
+                "id,departure_time,arrival_time,duration_hours,status"
+        ).in_("id", fids[i:i + 500]).execute().data or []):
+            fmap[f["id"]] = f
     by_crew: dict[str, list] = {}
     for a in asgs:
         f = fmap.get(a.get("flight_id"))
@@ -1073,32 +1156,34 @@ async def suggest_crew(
         cands.append({"crew": c, "monthly": monthly, "qualified": qualified,
                       "on_leave": status == "on_leave", "rested": rested})
 
-    # Cheap rank → shortlist → authoritative compliance on the shortlist only.
+    # Cheap rank → shortlist → BATCHED advisory readiness on the shortlist only.
     cands.sort(key=lambda x: (0 if x["qualified"] else 1,
                               0 if not x["on_leave"] else 1, x["monthly"]))
+    shortlist = cands[:limit]
     engine = ComplianceEngine(sb)
+    # ONE batched readiness pass (a handful of bulk queries) instead of N× deep
+    # check_crew calls — the latter timed out the suggest button on large rosters.
+    # The cheap pre-filter already removed hard time-conflicts and computed
+    # qualification/rest; the authoritative per-flight engine still runs at
+    # ASSIGN time (this list is advisory and re-checked on assignment).
+    board = engine.batch_readiness(cid, crew_rows=[x["crew"] for x in shortlist])
     out = []
-    for x in cands[:limit]:
+    for x in shortlist:
         c = x["crew"]
-        res = engine.check_crew(
-            crew_id=c["id"], flight_id=flight_id,
-            flight_departure=dep, flight_arrival=arr,
-            is_international=intl, flight_aircraft_type=ac_type,
-        )
-        readiness = engine._readiness_from_result(res)
+        rd = board.get(c["id"], {})
+        readiness_score = rd.get("readiness_score", 0)
+        # A crew member unqualified for THIS aircraft type can't be picked.
+        comp_status = "BLOCKED" if not x["qualified"] else rd.get("compliance_status", "GREEN")
+        blocking_reasons = list(rd.get("blocking_reasons", []))
+        if not x["qualified"]:
+            blocking_reasons = ["غير مؤهل لنوع الطائرة", *blocking_reasons]
 
         # ── Smart weighted assignment score (#3) ──────────────────
         max_monthly = float(c.get("max_monthly_hours") or settings.MAX_MONTHLY_HOURS)
-        fdp_min = None
-        for i in res.get("issues", []):
-            if i.get("rule", "").startswith("fdp_"):
-                fdp_min = (i.get("detail") or {}).get("fdp_minutes") \
-                          or (i.get("detail") or {}).get("actual_minutes")
-                break
-        score = _assignment_score(readiness["readiness_score"], x["monthly"],
-                                  max_monthly, x["rested"], fdp_min, x["qualified"])
+        score = _assignment_score(readiness_score, x["monthly"],
+                                  max_monthly, x["rested"], None, x["qualified"])
         reasons = [
-            f"الجاهزية {readiness['readiness_score']}",
+            f"الجاهزية {readiness_score}",
             f"ساعات {x['monthly']:.0f}h",
             "راحة مكتملة" if x["rested"] else "قيد الراحة",
             "مؤهل" if x["qualified"] else "غير مؤهل",
@@ -1113,13 +1198,13 @@ async def suggest_crew(
             "base":              c.get("base", ""),
             "monthly_hours":     round(x["monthly"], 1),
             "qualified":         x["qualified"],
-            "compliance_status": res.get("status"),
-            "blocking_reasons":  res.get("blocking_reasons", []),
+            "compliance_status": comp_status,
+            "blocking_reasons":  blocking_reasons,
             # Advisory readiness (Phase A) — does NOT gate assignment.
-            "readiness_score":   readiness["readiness_score"],
-            "readiness_status":  readiness["readiness_status"],
-            "readiness_color":   readiness["readiness_color"],
-            "readiness_reasons": readiness["readiness_reasons"],
+            "readiness_score":   readiness_score,
+            "readiness_status":  rd.get("readiness_status", ""),
+            "readiness_color":   rd.get("readiness_color", ""),
+            "readiness_reasons": rd.get("readiness_reasons", []),
             # Smart weighted assignment (Phase #3) — ranking aid, NOT a gate.
             "assignment_score":  score,
             "assignment_reasons": reasons,
@@ -1219,18 +1304,21 @@ async def assignment_projection(flight_id: str, crew_id: str,
 
 
 @router.delete("/{assignment_id}")
-async def remove_assignment(assignment_id: str, current_user: CurrentUser, sb: SbClient):
+async def remove_assignment(assignment_id: str, current_user: CurrentUser, sb: SbClient,
+                            reason: Optional[str] = Query(None)):
     # Removing an assignment is a scheduling action — same gate as creating
-    # one. Crew should use /decline if they cannot fly; deletion erases the
-    # audit trail and must stay with ops.
+    # one. Crew should use /decline if they cannot fly; deletion is audited
+    # below (who/when/which flight/which crew + a snapshot of the deleted row).
     _ensure_assigner(current_user)
-    existing = sb.table("assignments").select("id,flight_id,crew_id").eq("id", assignment_id).execute()
+    # Full row — the audit needs a snapshot, not just the ids.
+    existing = sb.table("assignments").select("*").eq("id", assignment_id).execute()
     if not existing.data:
         raise NotFoundError("Assignment", assignment_id)
+    deleted_row = existing.data[0]
 
     # Verify the assignment's flight belongs to this company
-    flight_id = existing.data[0].get("flight_id")
-    crew_id   = existing.data[0].get("crew_id")
+    flight_id = deleted_row.get("flight_id")
+    crew_id   = deleted_row.get("crew_id")
     flight = None
     if flight_id:
         flight_check = sb.table("flights").select("*").eq("id", flight_id).eq("company_id", current_user["company_id"]).execute()
@@ -1239,6 +1327,41 @@ async def remove_assignment(assignment_id: str, current_user: CurrentUser, sb: S
         flight = flight_check.data[0]
 
     sb.table("assignments").delete().eq("id", assignment_id).execute()
+
+    # ── Audit the deletion: who / when / flight / crew / role + row snapshot ──
+    try:
+        crew_row = {}
+        if crew_id:
+            cr = sb.table("crew").select("full_name_ar, full_name_en, rank") \
+                .eq("id", crew_id).execute()
+            crew_row = cr.data[0] if cr.data else {}
+        sb.table("audit_log").insert({
+            "user_id": current_user["id"],
+            "user_name": current_user.get("name_ar") or current_user.get("name_en")
+                         or current_user.get("email", ""),
+            "action": "remove_assignment",
+            "entity_type": "assignment",
+            "entity_id": assignment_id,
+            "company_id": current_user["company_id"],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "after_data": json.dumps({
+                "flight_id": flight_id,
+                "flight_number": (flight or {}).get("flight_number"),
+                "crew_id": crew_id,
+                "crew_name": crew_row.get("full_name_ar") or crew_row.get("full_name_en"),
+                "rank": deleted_row.get("assigned_role") or crew_row.get("rank"),
+                "duty_type": deleted_row.get("duty_type"),
+                "reason": (reason or "").strip() or None,
+                "deleted_assignment": {
+                    k: deleted_row.get(k)
+                    for k in ("id", "flight_id", "crew_id", "duty_type",
+                              "assigned_role", "assignment_type",
+                              "assigned_by", "created_at")
+                },
+            }, ensure_ascii=False),
+        }).execute()
+    except Exception:
+        logger.exception("audit_log write failed for remove_assignment %s", assignment_id)
 
     # ── Notify the crew member that they were removed from the flight ──
     # Assigning fans out a notification; removal must too, otherwise crew keep
@@ -1285,6 +1408,15 @@ async def remove_assignment(assignment_id: str, current_user: CurrentUser, sb: S
     except Exception as e:
         logger.warning("Unassign notification failed for crew %s: %s", crew_id, e)
 
+    # Removing crew from a finalised flight invalidates its GD → mark stale +
+    # alert Flight Ops. Best-effort; never fails the removal.
+    if flight_id:
+        try:
+            from app.api.v1.endpoints.flights import mark_gd_stale_if_finalized
+            mark_gd_stale_if_finalized(sb, current_user["company_id"], flight_id, actor=current_user)
+        except Exception:
+            logger.exception("GD stale-mark failed (remove) flight=%s", flight_id)
+
     return {"message": "Assignment removed successfully", "success": True}
 
 
@@ -1306,11 +1438,13 @@ async def get_flight_assignments(flight_id: str, current_user: CurrentUser, sb: 
 
 @router.post("/{assignment_id}/acknowledge")
 async def acknowledge_assignment(assignment_id: str, current_user: CurrentUser, sb: SbClient):
-    existing = sb.table("assignments").select("id,flight_id,crew_id").eq("id", assignment_id).execute()
+    existing = sb.table("assignments").select("*").eq("id", assignment_id).execute()
     if not existing.data:
         raise NotFoundError("Assignment", assignment_id)
 
     row = existing.data[0]
+    if row.get("acknowledged"):
+        return row   # idempotent — keep the ORIGINAL acknowledged_at
 
     # Verify the assignment's flight belongs to this company
     flight_id = row.get("flight_id")
@@ -1332,8 +1466,11 @@ async def acknowledge_assignment(assignment_id: str, current_user: CurrentUser, 
     result = sb.table("assignments").update({
         "acknowledged": True,
         "acknowledged_at": datetime.now(timezone.utc).isoformat(),
+        "declined": False,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", assignment_id).execute()
+    _acceptance_audit(sb, current_user, "assignment_accepted_by_crew", row, "",
+                      extra={"acceptance_status": "accepted", "via": "acknowledge"})
     return result.data[0] if result.data else {}
 
 
@@ -1375,6 +1512,9 @@ async def decline_assignment(
         "declined_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", assignment_id).execute()
+    _acceptance_audit(sb, current_user, "assignment_declined_by_crew", row,
+                      flight_number,
+                      extra={"acceptance_status": "declined", "note": reason or None})
 
     # Fan-out alert to schedulers + ops managers
     targets = sb.table("users").select("id")\
@@ -1402,6 +1542,199 @@ async def decline_assignment(
         sb.table("notifications").insert(rows).execute()
 
     return {"declined": True, "notified": len(rows)}
+
+
+# ── Crew Assignment Acceptance ────────────────────────────────────────────────
+# Roles that may pin an assignment administratively (phone/WhatsApp approval or
+# operational necessity) — a SUPERVISORY action with a mandatory reason.
+_ADMIN_CONFIRM_ROLES = {"super_admin", "admin", "ops_manager", "scheduler_admin"}
+
+
+def _acceptance_status_row(row: dict) -> str:
+    """declined > admin_confirmed > accepted > pending_acceptance."""
+    if row.get("declined"):
+        return "declined"
+    if row.get("admin_confirmed"):
+        return "admin_confirmed"
+    if row.get("acknowledged"):
+        return "accepted"
+    return "pending_acceptance"
+
+
+def _acceptance_audit(sb, user, action, row, flight_number, *, extra: dict | None = None):
+    try:
+        payload = {
+            "flight_id": row.get("flight_id"), "flight_number": flight_number,
+            "crew_id": row.get("crew_id"),
+        }
+        payload.update(extra or {})
+        sb.table("audit_log").insert({
+            "user_id": user["id"],
+            "user_name": user.get("name_ar") or user.get("name_en") or user.get("email", ""),
+            "action": action, "entity_type": "assignment", "entity_id": row.get("id"),
+            "company_id": user["company_id"],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "before_data": json.dumps(
+                {"acceptance_status": _acceptance_status_row(row)}, ensure_ascii=False),
+            "after_data": json.dumps(payload, ensure_ascii=False),
+        }).execute()
+    except Exception:
+        logger.exception("acceptance audit failed (%s)", action)
+
+
+@router.post("/{assignment_id}/respond")
+async def respond_assignment(assignment_id: str, data: dict,
+                             current_user: CurrentUser, sb: SbClient):
+    """Crew's EXPLICIT answer to their assignment: accepted | declined.
+
+    Reading the notification is NOT acceptance; only this action pins the crew
+    on the flight. Rules: own row only · flight must be PUBLISHED · accepted is
+    idempotent (the original accepted_at is preserved) · declined→accepted is
+    allowed only while the flight hasn't departed (safest self-recovery; after
+    departure-time any change needs a supervisor's admin-confirm)."""
+    if current_user.get("role") != "crew":
+        raise ForbiddenError("هذه النقطة لردّ أفراد الطاقم فقط")
+    response = str(data.get("response") or "").strip().lower()
+    if response not in ("accepted", "declined"):
+        raise HTTPException(status_code=422, detail="response يجب أن يكون accepted أو declined")
+    note = str(data.get("note") or "").strip()[:300]
+
+    existing = sb.table("assignments").select("*").eq("id", assignment_id).execute()
+    if not existing.data:
+        raise NotFoundError("Assignment", assignment_id)
+    row = existing.data[0]
+    if current_user.get("crew_id") != row.get("crew_id"):
+        raise ForbiddenError("لا يمكنك الرد على تكليف فرد آخر")
+
+    fres = sb.table("flights").select("flight_number, publish_status, departure_time") \
+        .eq("id", row.get("flight_id")).eq("company_id", current_user["company_id"]).execute()
+    if not fres.data:
+        raise NotFoundError("Assignment", assignment_id)
+    flight = fres.data[0]
+    fnum = flight.get("flight_number", "—")
+    if flight.get("publish_status") != "published":
+        raise HTTPException(status_code=422, detail="لا يمكن الرد قبل نشر الرحلة")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    crew_name = current_user.get("name_ar") or current_user.get("name_en") or "طاقم"
+
+    if response == "accepted":
+        if row.get("acknowledged"):
+            # Idempotent — keep the ORIGINAL accepted_at, no duplicate audit/notify.
+            return {"ok": True, "acceptance_status": "accepted",
+                    "accepted_at": row.get("acknowledged_at")}
+        if row.get("declined"):
+            dep = flight.get("departure_time")
+            try:
+                dep_dt = datetime.fromisoformat(str(dep).replace("Z", "+00:00")) if dep else None
+            except (ValueError, TypeError):
+                dep_dt = None
+            if dep_dt is not None and dep_dt <= datetime.now(timezone.utc):
+                raise HTTPException(
+                    status_code=422,
+                    detail="لا يمكن تغيير الرد بعد موعد الرحلة — راجع المجدول")
+        sb.table("assignments").update({
+            "acknowledged": True, "acknowledged_at": now_iso,
+            "declined": False, "declined_at": None, "decline_reason": None,
+            "updated_at": now_iso,
+        }).eq("id", assignment_id).execute()
+        _acceptance_audit(sb, current_user, "assignment_accepted_by_crew", row, fnum,
+                          extra={"acceptance_status": "accepted", "accepted_at": now_iso,
+                                 "crew_name": crew_name})
+        # Tell the assigner (only — no company-wide spam) the seat is confirmed.
+        try:
+            if row.get("assigned_by"):
+                sb.table("notifications").insert({
+                    "id": str(uuid.uuid4()), "user_id": row["assigned_by"],
+                    "type": "assignment_accepted",
+                    "title_ar": "موافقة على تكليف", "title_en": "Assignment accepted",
+                    "message_ar": f"وافق {crew_name} على الرحلة {fnum}",
+                    "message_en": f"{crew_name} accepted flight {fnum}",
+                    "reference_id": assignment_id, "reference_type": "assignment",
+                    "is_read": False, "created_at": now_iso,
+                }).execute()
+        except Exception as e:
+            logger.warning("accept notify failed: %s", e)
+        return {"ok": True, "acceptance_status": "accepted", "accepted_at": now_iso}
+
+    # ── declined ──
+    if row.get("declined"):
+        return {"ok": True, "acceptance_status": "declined",
+                "declined_at": row.get("declined_at")}      # idempotent
+    sb.table("assignments").update({
+        "acknowledged": False, "declined": True,
+        "decline_reason": note or None, "declined_at": now_iso,
+        "admin_confirmed": False,
+        "updated_at": now_iso,
+    }).eq("id", assignment_id).execute()
+    _acceptance_audit(sb, current_user, "assignment_declined_by_crew", row, fnum,
+                      extra={"acceptance_status": "declined", "declined_at": now_iso,
+                             "note": note or None, "crew_name": crew_name})
+    # Fan-out to schedulers/ops — the flight now needs a replacement.
+    try:
+        targets = sb.table("users").select("id") \
+            .eq("company_id", current_user["company_id"]) \
+            .in_("role", ["admin", "super_admin", "ops_manager",
+                          "scheduler", "scheduler_admin"]).execute()
+        notifs = [{
+            "id": str(uuid.uuid4()), "user_id": u["id"], "type": "assignment_declined",
+            "title_ar": "رفض تكليف — تحتاج الرحلة بديلاً",
+            "title_en": "Assignment declined — replacement needed",
+            "message_ar": f"رفض {crew_name} التكليف على الرحلة {fnum}"
+                          + (f" — السبب: {note}" if note else "")
+                          + " — تحتاج الرحلة إلى بديل",
+            "message_en": f"{crew_name} declined flight {fnum} — replacement needed",
+            "reference_id": assignment_id, "reference_type": "assignment",
+            "is_read": False, "created_at": now_iso,
+        } for u in (targets.data or [])]
+        if notifs:
+            sb.table("notifications").insert(notifs).execute()
+    except Exception as e:
+        logger.warning("decline fan-out failed: %s", e)
+    return {"ok": True, "acceptance_status": "declined", "declined_at": now_iso}
+
+
+@router.post("/{assignment_id}/admin-confirm")
+async def admin_confirm_assignment(assignment_id: str, data: dict,
+                                   current_user: CurrentUser, sb: SbClient):
+    """Supervisory pin of an assignment (phone/WhatsApp approval, operational
+    necessity…). Mandatory reason; fully audited. Counts as accepted for the
+    finalize/GD gate."""
+    if current_user.get("role") not in _ADMIN_CONFIRM_ROLES \
+            and not current_user.get("is_superuser"):
+        raise ForbiddenError("التثبيت الإداري للمشرفين فقط")
+    reason = str(data.get("reason") or "").strip()
+    if not reason:
+        raise HTTPException(status_code=422, detail="سبب التثبيت الإداري إلزامي")
+
+    existing = sb.table("assignments").select("*").eq("id", assignment_id).execute()
+    if not existing.data:
+        raise NotFoundError("Assignment", assignment_id)
+    row = existing.data[0]
+    fres = sb.table("flights").select("flight_number") \
+        .eq("id", row.get("flight_id")).eq("company_id", current_user["company_id"]).execute()
+    if not fres.data:
+        raise NotFoundError("Assignment", assignment_id)
+    fnum = fres.data[0].get("flight_number", "—")
+
+    if row.get("admin_confirmed"):
+        return {"ok": True, "acceptance_status": "admin_confirmed",
+                "admin_confirmed_at": row.get("admin_confirmed_at")}   # idempotent
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    sb.table("assignments").update({
+        "admin_confirmed": True,
+        "admin_confirmed_by": current_user["id"],
+        "admin_confirmed_at": now_iso,
+        "admin_confirm_reason": reason,
+        "declined": False,           # supervisor decision supersedes a decline
+        "updated_at": now_iso,
+    }).eq("id", assignment_id).execute()
+    _acceptance_audit(sb, current_user, "assignment_admin_confirmed", row, fnum,
+                      extra={"acceptance_status": "admin_confirmed",
+                             "reason": reason, "admin_confirmed_at": now_iso})
+    return {"ok": True, "acceptance_status": "admin_confirmed",
+            "admin_confirmed_at": now_iso}
 
 
 @router.post("/crew-self-report", status_code=201)
