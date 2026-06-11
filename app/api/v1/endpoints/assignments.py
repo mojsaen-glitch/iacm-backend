@@ -1784,3 +1784,421 @@ async def file_crew_self_report(
         sb.table("notifications").insert(rows).execute()
 
     return {"type": report_type, "notified": len(rows)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 3D — Replace Crew (استبدال فرد طاقم)
+# ONE audited operation replacing the manual remove+assign pair. No override
+# in v1: ANY blocking compliance issue stops the swap with 422. Create-then-
+# delete so a failed insert never leaves the flight short a crew member.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_REPLACE_DONE_STATUSES = {"departed", "in_air", "in-flight", "arrived",
+                          "landed", "completed"}
+
+
+def _flight_time_locked(flight: dict) -> bool:
+    """Replacement is meaningless once the flight has left (or finished)."""
+    if (flight.get("status") or "").lower() in _REPLACE_DONE_STATUSES:
+        return True
+    dep = flight.get("departure_time")
+    try:
+        if dep and datetime.fromisoformat(str(dep).replace("Z", "+00:00")) \
+                <= datetime.now(timezone.utc):
+            return True
+    except (ValueError, TypeError):
+        pass
+    return False
+
+
+@router.get("/replacement-candidates/{assignment_id}")
+async def replacement_candidates(assignment_id: str, current_user: CurrentUser,
+                                 sb: SbClient, rank: Optional[str] = Query(None)):
+    """Qualified, conflict-free replacement candidates for an existing
+    assignment: same rank (or ?rank=), type-rated, active, not already on the
+    flight, no time overlap. Ranked readiness-first then fewest computed month
+    hours — all batched, never a per-crew call."""
+    _ensure_assigner(current_user)
+    cid = current_user["company_id"]
+
+    a = sb.table("assignments").select("*").eq("id", assignment_id).execute()
+    if not a.data:
+        raise NotFoundError("Assignment", assignment_id)
+    old = a.data[0]
+    f = sb.table("flights").select("*").eq("id", old.get("flight_id")) \
+        .eq("company_id", cid).execute()
+    if not f.data:
+        # Cross-company assignments stay invisible (404, not 403).
+        raise NotFoundError("Assignment", assignment_id)
+    flight = f.data[0]
+
+    old_crew = {}
+    oc = sb.table("crew").select("id, rank, full_name_ar, full_name_en") \
+        .eq("id", old.get("crew_id")).execute()
+    if oc.data:
+        old_crew = oc.data[0]
+    want_rank = (rank or old.get("assigned_role") or old_crew.get("rank") or "").strip()
+
+    pool = sb.table("crew").select(
+        "id, full_name_ar, full_name_en, rank, base, employee_id, status, "
+        "aircraft_qualifications, max_monthly_hours") \
+        .eq("company_id", cid).eq("status", "active").eq("rank", want_rank) \
+        .execute().data or []
+
+    on_flight = {r.get("crew_id") for r in
+                 (sb.table("assignments").select("crew_id")
+                  .eq("flight_id", flight["id"]).execute().data or [])}
+    ac_type = (flight.get("aircraft_type") or "").strip().upper()
+
+    def _type_rated(c: dict) -> bool:
+        quals = (c.get("aircraft_qualifications") or "").upper()
+        # No data on either side → permissive (mirrors the engine).
+        return (not ac_type) or (not quals.strip()) or (ac_type in quals)
+
+    pool = [c for c in pool if c["id"] not in on_flight and _type_rated(c)]
+
+    # Time-overlap exclusion — one batched join over the flight window.
+    dep, arr = flight.get("departure_time"), flight.get("arrival_time")
+    busy: set = set()
+    if dep and arr and pool:
+        ids = [c["id"] for c in pool]
+        for i in range(0, len(ids), 100):
+            rows = sb.table("assignments").select(
+                "crew_id, flights!inner(departure_time, arrival_time, status)") \
+                .eq("flights.company_id", cid).neq("flights.status", "cancelled") \
+                .lt("flights.departure_time", arr).gt("flights.arrival_time", dep) \
+                .in_("crew_id", ids[i:i + 100]).execute().data or []
+            busy |= {r.get("crew_id") for r in rows if r.get("crew_id")}
+    pool = [c for c in pool if c["id"] not in busy]
+
+    # Advisory ranking only — the binding gate is the engine check in /replace.
+    readiness: dict = {}
+    try:
+        readiness = ComplianceEngine(sb).batch_readiness(cid, crew_rows=pool)
+    except Exception:
+        logger.exception("replacement-candidates readiness batch failed")
+    _order = {"GREEN": 0, "YELLOW": 1, "RED": 2}
+    out = []
+    for c in pool:
+        r = readiness.get(c["id"], {}) or {}
+        out.append({
+            "crew_id": c["id"],
+            "full_name_ar": c.get("full_name_ar"),
+            "full_name_en": c.get("full_name_en"),
+            "rank": c.get("rank"), "base": c.get("base"),
+            "employee_id": c.get("employee_id"),
+            "monthly_flight_hours": r.get("monthly_flight_hours", 0),
+            "max_monthly_hours": r.get("max_monthly_hours") or c.get("max_monthly_hours"),
+            "compliance_status": r.get("compliance_status") or "GREEN",
+            "blocking_reasons": r.get("blocking_reasons") or [],
+        })
+    out.sort(key=lambda x: (_order.get(x["compliance_status"], 1),
+                            float(x["monthly_flight_hours"] or 0)))
+    return {
+        "flight_id": flight["id"],
+        "flight_number": flight.get("flight_number"),
+        "replacing_crew_id": old.get("crew_id"),
+        "replacing_crew_name": old_crew.get("full_name_ar") or old_crew.get("full_name_en"),
+        "required_rank": want_rank,
+        "candidates": out[:30],
+        "total_eligible": len(out),
+    }
+
+
+@router.post("/{assignment_id}/replace")
+async def replace_assignment(assignment_id: str, data: dict,
+                             current_user: CurrentUser, sb: SbClient):
+    """Relieve the current crew member and assign a replacement in ONE audited
+    operation. Allowed for pending / declined / ACCEPTED rows — releasing an
+    accepted member is an OPERATIONAL RELEASE and is flagged as such in the
+    audit. Reason is always mandatory."""
+    _ensure_assigner(current_user)
+    cid = current_user["company_id"]
+
+    reason = (data.get("reason") or "").strip()
+    if not reason:
+        raise HTTPException(status_code=422, detail="سبب الاستبدال مطلوب")
+    new_crew_id = (data.get("replacement_crew_id") or "").strip()
+    if not new_crew_id:
+        raise HTTPException(status_code=422, detail="replacement_crew_id مطلوب")
+    notify = data.get("notify", True)
+
+    a = sb.table("assignments").select("*").eq("id", assignment_id).execute()
+    if not a.data:
+        raise NotFoundError("Assignment", assignment_id)
+    old = a.data[0]
+    if old.get("crew_id") == new_crew_id:
+        raise HTTPException(status_code=422, detail="البديل هو نفس الفرد الحالي")
+
+    f = sb.table("flights").select("*").eq("id", old.get("flight_id")) \
+        .eq("company_id", cid).execute()
+    if not f.data:
+        raise NotFoundError("Assignment", assignment_id)
+    flight = f.data[0]
+    flight_id = flight["id"]
+    fnum = flight.get("flight_number", "")
+
+    if (flight.get("status") or "").lower() == "cancelled":
+        raise HTTPException(status_code=422,
+                            detail=f"الرحلة {fnum} ملغاة — لا حاجة للاستبدال")
+    if _flight_time_locked(flight):
+        raise HTTPException(status_code=422,
+                            detail=f"لا يمكن الاستبدال بعد مغادرة الرحلة {fnum} أو اكتمالها")
+
+    cr = sb.table("crew").select("*").eq("id", new_crew_id) \
+        .eq("company_id", cid).execute()
+    if not cr.data:
+        raise NotFoundError("Crew member", new_crew_id)
+    new_crew = cr.data[0]
+    new_name = new_crew.get("full_name_ar") or new_crew.get("full_name_en") or new_crew_id
+    if (new_crew.get("status") or "active").lower() in \
+            ("blocked", "suspended", "inactive", "terminated"):
+        raise HTTPException(status_code=422,
+                            detail=f"{new_name}: غير نشط أو محظور — لا يصلح بديلاً")
+
+    dup = sb.table("assignments").select("id").eq("flight_id", flight_id) \
+        .eq("crew_id", new_crew_id).execute()
+    if dup.data:
+        raise ConflictError(f"{new_name} مكلّف أصلاً برحلة {fnum}")
+
+    new_rank = new_crew.get("rank", "")
+    if not _role_may_assign_rank(current_user.get("role", ""), new_rank):
+        raise ForbiddenError("هذا الدور يمكنه فقط تكليف طاقم اختصاصه")
+
+    # DNP vs the crew REMAINING on the flight (the relieved member is leaving).
+    remaining = [r["crew_id"] for r in
+                 (sb.table("assignments").select("crew_id")
+                  .eq("flight_id", flight_id).execute().data or [])
+                 if r.get("crew_id") and r["crew_id"] != old.get("crew_id")]
+    if remaining:
+        for (x, y) in get_approved_dnp_pairs(sb, cid):
+            for other in remaining:
+                if (new_crew_id == x and other == y) or (new_crew_id == y and other == x):
+                    raise ForbiddenError(
+                        "لا يمكن التكليف — قرار عدم تطيير (DNP) مع عضو مكلّف بنفس الرحلة")
+
+    duty_type = (old.get("duty_type") or "operating").lower()
+    is_operating = duty_type == "operating"
+    if is_operational_only(new_rank) or not is_operating:
+        # Riders / operational-only roles: light check (active account).
+        _acct = sb.table("users").select("is_active") \
+            .eq("crew_id", new_crew_id).execute().data or []
+        if _acct and _acct[0].get("is_active") is False:
+            raise HTTPException(status_code=422,
+                                detail=f"{new_name}: حساب المستخدم غير مفعّل")
+    else:
+        # Aircraft crew: FULL compliance. v1 has no override — any blocking
+        # issue (hard OR FTL) stops the replacement.
+        dep_s = flight.get("departure_time", "")
+        arr_s = flight.get("arrival_time", "")
+        dep_dt = datetime.fromisoformat(dep_s.replace("Z", "+00:00")) if dep_s else None
+        arr_dt = datetime.fromisoformat(arr_s.replace("Z", "+00:00")) if arr_s else None
+        is_intl = (flight.get("origin_code", "").upper() not in IRAQI_AIRPORTS or
+                   flight.get("destination_code", "").upper() not in IRAQI_AIRPORTS)
+        res = ComplianceEngine(sb).check_crew(
+            crew_id=new_crew_id, flight_id=flight_id,
+            flight_departure=dep_dt, flight_arrival=arr_dt,
+            is_international=is_intl,
+            flight_aircraft_type=flight.get("aircraft_type"))
+        blocking = [i for i in res.get("issues", []) if i.get("is_blocking")]
+        if blocking:
+            reasons = "; ".join(i.get("message_ar", "") for i in blocking) \
+                      or "مخالفة امتثال"
+            raise HTTPException(status_code=422, detail=f"{new_name}: {reasons}")
+
+    # Slot-neutral swap (inherits the relieved member's duty type and slot),
+    # so the complement-capacity gate is deliberately not re-run here.
+    old_status = _acceptance_status_row(old)
+    operational_release = old_status in ("accepted", "admin_confirmed")
+
+    new_assignment = {
+        "id": str(uuid.uuid4()),
+        "flight_id": flight_id,
+        "crew_id": new_crew_id,
+        "assigned_by": current_user["id"],
+        "assignment_type": _bucket_for_rank(new_rank),
+        "assigned_role": new_rank,
+        "operator_company_id": new_crew.get("operator_company_id"),
+        "duty_type": duty_type,
+        "is_override": False,
+        "acknowledged": False,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        ins = sb.table("assignments").insert(new_assignment).execute()
+        saved = (ins.data or [new_assignment])[0]
+    except Exception as e:
+        logger.exception("replace INSERT failed crew=%s flight=%s", new_crew_id, flight_id)
+        raise HTTPException(
+            status_code=502,
+            detail=f"تعذّر إنشاء تكليف البديل — لم يُمَسّ التكليف الأصلي: {str(e)[:160]}")
+
+    try:
+        sb.table("assignments").delete().eq("id", assignment_id).execute()
+    except Exception as e:
+        # Roll the swap back — never leave BOTH crew on the flight silently.
+        try:
+            sb.table("assignments").delete().eq("id", new_assignment["id"]).execute()
+        except Exception:
+            logger.exception("replace ROLLBACK failed for %s", new_assignment["id"])
+        logger.exception("replace DELETE failed for %s", assignment_id)
+        raise HTTPException(
+            status_code=502,
+            detail=f"تعذّر إعفاء الفرد الحالي — أُلغي تكليف البديل: {str(e)[:160]}")
+
+    # Finalised flight → GD goes stale + Flight Ops alerted (existing helper).
+    try:
+        from app.api.v1.endpoints.flights import mark_gd_stale_if_finalized
+        mark_gd_stale_if_finalized(sb, cid, flight_id, actor=current_user)
+    except Exception:
+        logger.exception("mark_gd_stale failed after replace on %s", flight_id)
+
+    old_crew_row = {}
+    try:
+        ocr = sb.table("crew").select("full_name_ar, full_name_en, rank") \
+            .eq("id", old.get("crew_id")).execute()
+        old_crew_row = ocr.data[0] if ocr.data else {}
+    except Exception:
+        pass
+    old_name = old_crew_row.get("full_name_ar") or old_crew_row.get("full_name_en") \
+        or old.get("crew_id")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    # ── Audit: ONE record tells the whole story (who left, in what acceptance
+    # state, who came in, why) — operational_release marks releasing a member
+    # who had already ACCEPTED the duty.
+    try:
+        sb.table("audit_log").insert({
+            "user_id": current_user["id"],
+            "user_name": current_user.get("name_ar") or current_user.get("name_en")
+                         or current_user.get("email", ""),
+            "action": "assignment_replaced",
+            "entity_type": "assignment",
+            "entity_id": assignment_id,
+            "company_id": cid,
+            "created_at": now_iso,
+            "before_data": json.dumps({
+                "crew_id": old.get("crew_id"),
+                "crew_name": old_name,
+                "acceptance_status": old_status,
+                "assignment": {k: old.get(k) for k in (
+                    "id", "flight_id", "crew_id", "duty_type", "assigned_role",
+                    "assignment_type", "assigned_by", "acknowledged",
+                    "acknowledged_at", "declined", "declined_at",
+                    "decline_reason", "admin_confirmed", "created_at")},
+            }, ensure_ascii=False),
+            "after_data": json.dumps({
+                "flight_id": flight_id,
+                "flight_number": fnum,
+                "replacement_crew_id": new_crew_id,
+                "replacement_crew_name": new_name,
+                "new_assignment_id": saved.get("id"),
+                "duty_type": duty_type,
+                "reason": reason,
+                "operational_release": operational_release,
+                "acceptance_status": "pending_acceptance",
+            }, ensure_ascii=False),
+        }).execute()
+    except Exception:
+        logger.exception("audit_log write failed for replace %s", assignment_id)
+
+    published = (flight.get("publish_status") or "") == "published"
+    origin = flight.get("origin_code", "")
+    dest = flight.get("destination_code", "")
+
+    if notify:
+        # Relieved member — operational release notice.
+        try:
+            ou = sb.table("users").select("id").eq("crew_id", old.get("crew_id")).execute()
+            if ou.data:
+                uid = ou.data[0]["id"]
+                t_ar = f"تم إعفاؤك من رحلة {fnum}"
+                m_ar = (f"رحلة {fnum} ({origin} → {dest}) — تم إعفاؤك من التكليف "
+                        f"لأسباب تشغيلية.")
+                sb.table("notifications").insert({
+                    "id": str(uuid.uuid4()), "user_id": uid, "target_user_id": uid,
+                    "company_id": cid, "type": "assignment_replaced",
+                    "title_ar": t_ar, "title_en": f"Released from flight {fnum}",
+                    "message_ar": m_ar,
+                    "message_en": f"Flight {fnum} ({origin} -> {dest}) — you were "
+                                  f"released for operational reasons.",
+                    "body_ar": m_ar, "body_en": m_ar,
+                    "reference_id": flight_id, "reference_type": "flight",
+                    "related_flight_id": flight_id,
+                    "related_crew_id": old.get("crew_id"),
+                    "is_read": False, "created_at": now_iso, "updated_at": now_iso,
+                }).execute()
+                try:
+                    push_service.send_to_users(sb, [uid], title=t_ar, body=m_ar,
+                                               data={"type": "assignment_replaced",
+                                                     "flight_id": flight_id})
+                except Exception:
+                    logger.exception("push failed (released crew) %s", uid)
+        except Exception:
+            logger.exception("release notification failed for %s", old.get("crew_id"))
+
+        # Replacement — notified only when the flight is VISIBLE to crew
+        # (published). Draft rosters keep their isolation; publish will notify.
+        if published:
+            try:
+                nu = sb.table("users").select("id").eq("crew_id", new_crew_id).execute()
+                if nu.data:
+                    uid = nu.data[0]["id"]
+                    t_ar = f"تكليف جديد — رحلة {fnum}"
+                    m_ar = (f"كُلّفت برحلة {fnum} ({origin} → {dest}) — "
+                            f"بانتظار موافقتك من بوابة الطاقم.")
+                    sb.table("notifications").insert({
+                        "id": str(uuid.uuid4()), "user_id": uid, "target_user_id": uid,
+                        "company_id": cid, "type": "crew_assigned",
+                        "title_ar": t_ar, "title_en": f"New duty — flight {fnum}",
+                        "message_ar": m_ar,
+                        "message_en": f"Assigned to flight {fnum} ({origin} -> {dest}) "
+                                      f"— awaiting your acceptance.",
+                        "body_ar": m_ar, "body_en": m_ar,
+                        "reference_id": flight_id, "reference_type": "flight",
+                        "related_flight_id": flight_id,
+                        "related_crew_id": new_crew_id,
+                        "is_read": False, "created_at": now_iso, "updated_at": now_iso,
+                    }).execute()
+                    try:
+                        push_service.send_to_users(sb, [uid], title=t_ar, body=m_ar,
+                                                   data={"type": "crew_assigned",
+                                                         "flight_id": flight_id})
+                    except Exception:
+                        logger.exception("push failed (replacement crew) %s", uid)
+            except Exception:
+                logger.exception("replacement notification failed for %s", new_crew_id)
+
+        # Live (published) roster changed → schedulers/ops must review the
+        # schedule and regenerate GD if one was produced.
+        if published:
+            try:
+                from app.api.v1.endpoints.flights import _insert_role_notifications
+                _insert_role_notifications(
+                    sb, cid,
+                    ("admin", "super_admin", "ops_manager", "scheduler", "scheduler_admin"),
+                    "roster_changed",
+                    f"تغيير طاقم رحلة منشورة {fnum}",
+                    f"Published roster changed {fnum}",
+                    f"استُبدل {old_name} بالبديل {new_name} في رحلة {fnum} "
+                    f"({origin} → {dest}) — راجع الجدول وأعد توليد GD إن كان مولّداً.",
+                    f"{old_name} replaced by {new_name} on {fnum} — review the "
+                    f"roster / regenerate GD if needed.",
+                    flight_id)
+            except Exception:
+                logger.exception("roster_changed fan-out failed for %s", flight_id)
+
+    return {
+        "replaced": True,
+        "flight_id": flight_id,
+        "flight_number": fnum,
+        "old_assignment_id": assignment_id,
+        "old_crew_id": old.get("crew_id"),
+        "old_crew_name": old_name,
+        "old_acceptance_status": old_status,
+        "operational_release": operational_release,
+        "new_assignment": saved,
+        "acceptance_status": "pending_acceptance",
+        "gd_review": (flight.get("roster_finalized_status") == "finalized"),
+    }
