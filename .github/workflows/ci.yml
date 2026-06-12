@@ -25,3 +25,33 @@ jobs:
         run: pip install -r requirements.txt -r requirements-dev.txt
       - name: Run tests
         run: python -m pytest -q
+
+  # Backup/restore scripts must never silently rot: syntax-check + dry-run
+  # with DUMMY values (clearly fake — no secrets, no network, no database).
+  scripts-lint:
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_BACKUP_URL: "postgres://dummy@prod-host.example/db"
+      BACKUP_STORAGE_ENDPOINT: "https://storage.example"
+      BACKUP_STORAGE_BUCKET: "dummy-bucket"
+      BACKUP_STORAGE_ACCESS_KEY_ID: "ci-dummy"
+      BACKUP_STORAGE_SECRET_ACCESS_KEY: "ci-dummy"
+      BACKUP_ENCRYPTION_KEY: "ci-dummy"
+      RESTORE_DATABASE_URL: "postgres://dummy@scratch-host.example/db"
+      RESTORE_CONFIRM_NON_PROD: "yes"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: bash -n scripts/backup_db.sh scripts/restore_check.sh
+      - name: Backup dry-run
+        run: bash scripts/backup_db.sh --dry-run
+      - name: Restore-check dry-run (guards pass on different host)
+        run: bash scripts/restore_check.sh --dry-run
+      - name: Restore-check REFUSES the production host
+        run: |
+          if RESTORE_DATABASE_URL="$DATABASE_BACKUP_URL" \
+             bash scripts/restore_check.sh --dry-run; then
+            echo "guard FAILED to refuse same-host restore"; exit 1
+          else
+            echo "guard correctly refused same-host restore"
+          fi

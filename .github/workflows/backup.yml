@@ -1,0 +1,36 @@
+# Daily EXTERNAL database backup — runs on GitHub infrastructure (never inside
+# the serving environment) and uploads encrypted dumps to S3-compatible
+# storage. All credentials come from GitHub Actions SECRETS (names only here).
+# NOTE: this workflow runs the REAL backup against the database the owner
+# points DATABASE_BACKUP_URL at — it is intentionally NOT part of repo CI.
+name: DB Backup
+
+on:
+  schedule:
+    - cron: "30 2 * * *"      # daily 02:30 UTC (05:30 Baghdad)
+  workflow_dispatch: {}        # manual trigger for the first proof run
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install postgres client 17
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSo /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+            http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-17
+      - name: Run backup
+        env:
+          DATABASE_BACKUP_URL:              ${{ secrets.DATABASE_BACKUP_URL }}
+          BACKUP_STORAGE_ENDPOINT:          ${{ secrets.BACKUP_STORAGE_ENDPOINT }}
+          BACKUP_STORAGE_BUCKET:            ${{ secrets.BACKUP_STORAGE_BUCKET }}
+          BACKUP_STORAGE_ACCESS_KEY_ID:     ${{ secrets.BACKUP_STORAGE_ACCESS_KEY_ID }}
+          BACKUP_STORAGE_SECRET_ACCESS_KEY: ${{ secrets.BACKUP_STORAGE_SECRET_ACCESS_KEY }}
+          BACKUP_ENCRYPTION_KEY:            ${{ secrets.BACKUP_ENCRYPTION_KEY }}
+        run: bash scripts/backup_db.sh
