@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 from app.api.v1.endpoints import (
     app_meta,
+    operational_settings,
     monthly_hours,
     companies,
     auth,
@@ -36,6 +37,7 @@ from app.api.v1.endpoints import (
 api_router = APIRouter()
 
 api_router.include_router(app_meta.router)
+api_router.include_router(operational_settings.router)
 api_router.include_router(monthly_hours.router)
 api_router.include_router(companies.router)
 api_router.include_router(auth.router)
