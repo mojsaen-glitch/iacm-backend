@@ -1,0 +1,27 @@
+# Backend CI — runs the full pytest suite on every push and PR.
+# The suite uses in-memory fakes (never a live DB), so the env vars below are
+# DUMMY placeholders required only by Settings validation — not secrets.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  backend-tests:
+    runs-on: ubuntu-latest
+    env:
+      SECRET_KEY: ci-dummy-not-a-secret
+      JWT_SECRET_KEY: ci-dummy-not-a-secret
+      SUPABASE_URL: http://localhost:54321
+      SUPABASE_SERVICE_KEY: ci-dummy-not-a-secret
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run tests
+        run: python -m pytest -q
