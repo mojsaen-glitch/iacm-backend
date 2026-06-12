@@ -464,7 +464,8 @@ async def get_flight_roster(flight_id: str, current_user: CurrentUser, sb: SbCli
     # ── Per-section expected complement (the GenDec template) ────────────────
     # Counted sections (flight_deck/cabin_crew) use the safety-floor minimums.
     # Operational sections use the per-aircraft operational template.
-    op_by_role = operational_expected_by_role(aircraft_type)
+    op_by_role = operational_expected_by_role(
+        aircraft_type, sb=sb, company_id=current_user["company_id"])
     # Aggregate operational expectations per section.
     op_per_section: dict[str, dict[str, int]] = {
         CAT_TECHNICAL: {}, CAT_GROUND: {}, CAT_SECURITY: {}, CAT_OBSERVER: {},
@@ -474,8 +475,10 @@ async def get_flight_roster(flight_id: str, current_user: CurrentUser, sb: SbCli
         if cat in op_per_section:
             op_per_section[cat][role_key] = expected
 
-    fd_by_role = flight_deck_expected_by_role(aircraft_type, block_h)
-    cc_by_role = cabin_crew_expected_by_role(aircraft_type)
+    fd_by_role = flight_deck_expected_by_role(
+        aircraft_type, block_h, sb=sb, company_id=current_user["company_id"])
+    cc_by_role = cabin_crew_expected_by_role(
+        aircraft_type, sb=sb, company_id=current_user["company_id"])
     expected: dict[str, dict] = {
         CAT_FLIGHT_DECK: {
             "min": sum(fd_by_role.values()),
@@ -661,7 +664,9 @@ async def assign_crew(data: dict, current_user: CurrentUser, sb: SbClient):
                 _arr = datetime.fromisoformat(flight["arrival_time"].replace("Z", "+00:00")) \
                     if flight.get("arrival_time") else None
                 dur_h = (_arr - _dep).total_seconds() / 3600 if (_dep and _arr) else None
-            cap = required_for_category(flight.get("aircraft_type"), category, dur_h)
+            cap = required_for_category(
+                flight.get("aircraft_type"), category, dur_h,
+                sb=sb, company_id=current_user["company_id"])
             if cap is not None and operating_crew_ids:
                 rank_rows = sb.table("crew").select("rank") \
                     .in_("id", operating_crew_ids).execute().data or []
@@ -678,7 +683,9 @@ async def assign_crew(data: dict, current_user: CurrentUser, sb: SbClient):
         # Per-role cap for OPERATIONAL roles (AME / L/SH / IFSO / OBS / US / Tech).
         # Same rule: only operating rows count toward the cap.
         if is_operational:
-            op_template = operational_expected_by_role(flight.get("aircraft_type"))
+            op_template = operational_expected_by_role(
+                flight.get("aircraft_type"),
+                sb=sb, company_id=current_user["company_id"])
             canonical_role = normalize_role(crew_rank)
             per_role_cap = op_template.get(canonical_role, 0)
             if per_role_cap > 0 and operating_crew_ids:
@@ -903,7 +910,9 @@ async def assign_connected_duty(data: dict, current_user: CurrentUser, sb: SbCli
                 dur_h = (_a - _d).total_seconds() / 3600
             exist_ranks = [{"rank": _rank_by_crew.get(eid)} for eid in _exist_by_flight.get(fid, [])]
             for cat in ("pilot", "cabin", "engineer"):
-                cap = required_for_category(fl.get("aircraft_type"), cat, dur_h)
+                cap = required_for_category(
+                    fl.get("aircraft_type"), cat, dur_h,
+                    sb=sb, company_id=current_user["company_id"])
                 if cap is None:
                     continue
                 cur = sum(1 for r in (exist_ranks or []) if category_for_rank(r.get("rank")) == cat)

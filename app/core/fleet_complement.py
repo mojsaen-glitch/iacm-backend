@@ -54,6 +54,70 @@ _OPERATIONAL: dict[str, dict[str, int]] = {
 }
 _OPERATIONAL_GENERIC = {"ame": 1, "lsh": 1, "ifso": 1, "obs": 0, "us": 0, "tech": 0}
 
+
+# ── Per-company template resolution (batch 2 of the company-settings plan) ──
+# The three ops.fleet.* keys may override these templates PER COMPANY. With no
+# sb/company context, no stored row, or ANY malformed value, every function
+# below behaves EXACTLY as the constants above — fail-open by design, so a
+# broken settings row can never weaken or break a safety gate.
+_AUGMENT_THRESHOLD_HOURS_DEFAULT = 8
+
+
+def _tupleize_fleet(raw: dict) -> tuple[dict, tuple]:
+    """settings dict-form -> internal tuple form. Raises on malformation."""
+    fleet: dict = {}
+    for t, spec in raw.items():
+        if t == "_generic":
+            continue
+        fleet[str(t).upper()] = (
+            int(spec["min_pilots"]), int(spec["max_pilots"]),
+            int(spec["min_cabin"]), int(spec["max_cabin"]),
+            int(spec["engineers"]),
+        )
+    g = raw.get("_generic")
+    generic = (int(g["min_pilots"]), int(g["max_pilots"]), int(g["min_cabin"]),
+               int(g["max_cabin"]), int(g["engineers"])) if g else _GENERIC
+    if not fleet:
+        raise ValueError("empty fleet template")
+    return fleet, generic
+
+
+def _resolved_templates(sb=None, company_id=None):
+    """(fleet, generic, augment_h, operational, operational_generic) for this
+    company — today's constants when unset/unreadable (never raises)."""
+    if sb is None or company_id is None:
+        return (_FLEET, _GENERIC, _AUGMENT_THRESHOLD_HOURS_DEFAULT,
+                _OPERATIONAL, _OPERATIONAL_GENERIC)
+    from app.core.company_settings import get_company_setting
+    try:
+        fleet, generic = _tupleize_fleet(
+            get_company_setting(sb, company_id, "ops.fleet.complement"))
+    except Exception:
+        fleet, generic = _FLEET, _GENERIC
+    try:
+        thr = float(get_company_setting(
+            sb, company_id, "ops.fleet.augment_threshold_hours"))
+        if thr <= 0:
+            raise ValueError
+    except Exception:
+        thr = _AUGMENT_THRESHOLD_HOURS_DEFAULT
+    try:
+        raw = get_company_setting(
+            sb, company_id, "ops.fleet.operational_complement")
+        blank = {k: 0 for k in _OPERATIONAL_GENERIC}
+        op = {str(t).upper(): {**blank,
+                               **{k: int(v) for k, v in (spec or {}).items()}}
+              for t, spec in raw.items() if t != "_generic"}
+        opg = {**blank,
+               **{k: int(v) for k, v in (raw.get("_generic")
+                                         or _OPERATIONAL_GENERIC).items()}}
+        if not op:
+            raise ValueError("empty operational template")
+    except Exception:
+        op, opg = _OPERATIONAL, _OPERATIONAL_GENERIC
+    return fleet, generic, thr, op, opg
+
+
 # Map operational template keys → canonical role keys (crew_roles registry).
 # Used to render "expected vs assigned" per role in the roster endpoint.
 OPERATIONAL_KEY_TO_ROLE: dict[str, str] = {
@@ -98,18 +162,20 @@ def is_captain_rank(rank: str | None) -> bool:
 
 
 def required_for_category(aircraft_type: str | None, category: str,
-                          duration_hours: float | None) -> int | None:
+                          duration_hours: float | None, *,
+                          sb=None, company_id=None) -> int | None:
     """Max crew this flight may carry in `category` (the over-staffing ceiling).
 
     Returns None for 'other' (no complement limit defined — never capped).
     """
-    spec = _FLEET.get((aircraft_type or "").upper(), _GENERIC)
+    fleet, generic, augment_h, _op, _opg = _resolved_templates(sb, company_id)
+    spec = fleet.get((aircraft_type or "").upper(), generic)
     min_p, max_p, min_a, max_a, eng = spec
     if category == "pilot":
-        # Augmented crew only for wide-body (max>min) long-haul (≥8h).
+        # Augmented crew only for wide-body (max>min) long-haul (≥ threshold).
         if max_p <= min_p:
             return min_p
-        return max_p if (duration_hours or 0) >= 8 else min_p
+        return max_p if (duration_hours or 0) >= augment_h else min_p
     if category == "cabin":
         return max_a
     if category == "engineer":
@@ -117,11 +183,13 @@ def required_for_category(aircraft_type: str | None, category: str,
     return None
 
 
-def min_required_for_category(aircraft_type: str | None, category: str) -> int:
+def min_required_for_category(aircraft_type: str | None, category: str, *,
+                              sb=None, company_id=None) -> int:
     """Minimum crew a flight MUST carry in `category` (the safety floor) before
     it can be published. Pilots → minimum cockpit; cabin → exit-count floor;
     engineer → 0 on the modern fleet."""
-    spec = _FLEET.get((aircraft_type or "").upper(), _GENERIC)
+    fleet, generic, _h, _op, _opg = _resolved_templates(sb, company_id)
+    spec = fleet.get((aircraft_type or "").upper(), generic)
     min_p, _max_p, min_a, _max_a, eng = spec
     if category == "pilot":
         return min_p
@@ -132,7 +200,8 @@ def min_required_for_category(aircraft_type: str | None, category: str) -> int:
     return 0
 
 
-def operational_complement_for(aircraft_type: str | None) -> dict[str, int]:
+def operational_complement_for(aircraft_type: str | None, *,
+                               sb=None, company_id=None) -> dict[str, int]:
     """Per-aircraft operational (NOT counted) complement template.
 
     Returns a dict mapping short keys (ame/lsh/ifso/obs/us/tech) to the
@@ -143,13 +212,15 @@ def operational_complement_for(aircraft_type: str | None) -> dict[str, int]:
     Use ``OPERATIONAL_KEY_TO_ROLE`` to translate keys to canonical
     ``crew.rank`` role values (registry-aligned).
     """
-    spec = _OPERATIONAL.get((aircraft_type or "").upper())
+    _f, _g, _h, op, opg = _resolved_templates(sb, company_id)
+    spec = op.get((aircraft_type or "").upper())
     if spec is None:
-        return dict(_OPERATIONAL_GENERIC)
+        return dict(opg)
     return dict(spec)
 
 
-def operational_expected_by_role(aircraft_type: str | None) -> dict[str, int]:
+def operational_expected_by_role(aircraft_type: str | None, *,
+                                 sb=None, company_id=None) -> dict[str, int]:
     """Same template but keyed by canonical role (matches crew_roles registry).
 
     Example for B737:
@@ -160,35 +231,40 @@ def operational_expected_by_role(aircraft_type: str | None) -> dict[str, int]:
           "observer": 0, "security_staff": 0, "technical_staff": 0,
         }
     """
-    short = operational_complement_for(aircraft_type)
+    short = operational_complement_for(aircraft_type, sb=sb,
+                                       company_id=company_id)
     return {OPERATIONAL_KEY_TO_ROLE[k]: v for k, v in short.items()}
 
 
 # ── Counted sections (flight_deck / cabin_crew) — per-role breakdown ────────
 def flight_deck_expected_by_role(aircraft_type: str | None,
-                                 duration_hours: float | None = None) -> dict[str, int]:
+                                 duration_hours: float | None = None, *,
+                                 sb=None, company_id=None) -> dict[str, int]:
     """Per-role expected complement for the flight_deck section.
 
     The cockpit always has exactly 1 captain; the rest of the min cockpit are
     first officers. On wide-body long-haul (≥ 8h) the cockpit augments and the
     extra crew are counted as additional F/Os.
     """
-    spec = _FLEET.get((aircraft_type or "").upper(), _GENERIC)
+    fleet, generic, augment_h, _op, _opg = _resolved_templates(sb, company_id)
+    spec = fleet.get((aircraft_type or "").upper(), generic)
     min_p, max_p, _min_a, _max_a, _eng = spec
     # Augmented crew on wide-body long-haul.
-    pilots = max_p if (max_p > min_p and (duration_hours or 0) >= 8) else min_p
+    pilots = max_p if (max_p > min_p and (duration_hours or 0) >= augment_h) else min_p
     fo = max(pilots - 1, 0)
     return {"pilot_captain": 1, "pilot_first_officer": fo}
 
 
-def cabin_crew_expected_by_role(aircraft_type: str | None) -> dict[str, int]:
+def cabin_crew_expected_by_role(aircraft_type: str | None, *,
+                                sb=None, company_id=None) -> dict[str, int]:
     """Per-role expected complement for the cabin_crew section.
 
     Always 1 Senior Cabin Crew (purser); the remaining seats are regular CC up
     to the cabin ceiling (e.g. B737-800 → 1 SCC + 4 CC = 5).
     CR9 has no SCC slot (small narrow-body) → all cabin seats are CC.
     """
-    spec = _FLEET.get((aircraft_type or "").upper(), _GENERIC)
+    fleet, generic, _h, _op, _opg = _resolved_templates(sb, company_id)
+    spec = fleet.get((aircraft_type or "").upper(), generic)
     _min_p, _max_p, _min_a, max_a, _eng = spec
     if max_a <= 2:                          # CR9 — no SCC slot
         return {"senior_cabin_crew": 0, "cabin_crew": max_a}

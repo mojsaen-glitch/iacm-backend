@@ -1017,8 +1017,11 @@ def _min_crew_shortfalls(sb, flight: dict) -> list[str]:
     pilots   = sum(1 for r in ranks if category_for_rank(r) == "pilot")
     cabin    = sum(1 for r in ranks if category_for_rank(r) == "cabin")
     captains = sum(1 for r in ranks if is_captain_rank(r))
-    need_pilots = min_required_for_category(ac_type, "pilot")
-    need_cabin  = min_required_for_category(ac_type, "cabin")
+    cid = flight.get("company_id")
+    need_pilots = min_required_for_category(ac_type, "pilot",
+                                            sb=sb, company_id=cid)
+    need_cabin  = min_required_for_category(ac_type, "cabin",
+                                            sb=sb, company_id=cid)
 
     out: list[str] = []
     if captains < 1:
