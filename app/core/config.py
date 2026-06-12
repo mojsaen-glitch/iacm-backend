@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     # disables the cron endpoint (returns 403). Set via env, never committed.
     CRON_SECRET: str = ""
 
+    # Error tracking (Sentry) — inert when SENTRY_DSN is unset.
+    SENTRY_DSN: str = ""
+    SENTRY_ENV: str = "production"
+
     # JWT
     JWT_SECRET_KEY: str
     JWT_ALGORITHM: str = "HS256"

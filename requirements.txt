@@ -51,3 +51,6 @@ APScheduler==3.10.4
 psutil==6.1.1
 # 2FA TOTP — RFC 6238 codes (Google Authenticator / Authy / 1Password).
 pyotp==2.9.0
+
+# Error tracking
+sentry-sdk[fastapi]==2.19.2

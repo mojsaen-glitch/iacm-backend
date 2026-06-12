@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 from app.core.config import settings
 from app.core.exceptions import IACMException
 from app.core.rate_limit import limiter
+from app.api.deps import CurrentUser
 from app.api.v1.router import api_router
 from app.websockets.manager import ws_manager
 from app.middleware.metrics_middleware import MetricsMiddleware
@@ -70,6 +71,19 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
+
+# ── Error tracking (Sentry) — initialised ONLY when SENTRY_DSN is set, so
+# environments without it (CI, local) are unaffected. No PII, no traces:
+# we want errors + alerts, not request bodies.
+if settings.SENTRY_DSN:
+    import sentry_sdk
+    sentry_sdk.init(
+        dsn=settings.SENTRY_DSN,
+        environment=settings.SENTRY_ENV,
+        release=settings.APP_VERSION,
+        send_default_pii=False,
+        traces_sample_rate=0.0,
+    )
 
 app = FastAPI(
     title=settings.APP_NAME,
@@ -247,3 +261,15 @@ async def root():
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "version": settings.APP_VERSION, "db": "supabase"}
+
+
+@app.get("/api/v1/system/sentry-test")
+async def sentry_test(current_user: "CurrentUser"):
+    """Deliberate, gated error — verifies the alerting pipeline end-to-end
+    (Sentry captures unhandled exceptions when SENTRY_DSN is configured).
+    super_admin only; never reachable anonymously."""
+    if current_user.get("role") != "super_admin" \
+            and not current_user.get("is_superuser"):
+        from app.core.exceptions import ForbiddenError
+        raise ForbiddenError("super_admin فقط")
+    raise RuntimeError("Sentry alert test — خطأ مقصود للتحقق من وصول التنبيهات")
