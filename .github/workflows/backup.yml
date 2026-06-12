@@ -6,9 +6,12 @@
 name: DB Backup
 
 on:
-  schedule:
-    - cron: "30 2 * * *"      # daily 02:30 UTC (05:30 Baghdad)
-  workflow_dispatch: {}        # manual trigger for the first proof run
+  # Daily schedule is INTENTIONALLY disabled until the owner configures the
+  # six backup secrets — otherwise every run would be an expected-red noise.
+  # Re-enable after the first successful manual proof run:
+  # schedule:
+  #   - cron: "30 2 * * *"    # daily 02:30 UTC (05:30 Baghdad)
+  workflow_dispatch: {}        # manual trigger only, for the proof run
 
 jobs:
   backup:
