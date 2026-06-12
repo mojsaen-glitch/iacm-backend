@@ -2,9 +2,9 @@ import uuid
 import time
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query
 from app.api.deps import SbClient, CurrentUser
 from app.core.exceptions import NotFoundError, ConflictError, FTLViolationError, CrewBlockedError, ForbiddenError
 from app.core.config import settings
@@ -1230,6 +1230,18 @@ async def crew_readiness_board(current_user: CurrentUser, sb: SbClient):
     return {"crew": board, "count": len(board)}
 
 
+@router.get("/month-hours")
+async def month_hours(current_user: CurrentUser, sb: SbClient):
+    """REAL credited month hours per crew for the whole company in ONE paged
+    join — REPORT policy (operating only, cancelled excluded, Baghdad month).
+    Feeds client-side fairness ranking (auto-assign). ADVISORY ONLY — the
+    binding FTL gates stay in assign_crew. Crew with 0 credited hours are
+    absent from the map (treat missing as 0)."""
+    _ensure_assigner(current_user)
+    from app.core.monthly_hours import month_hours_by_crew
+    return {"hours": month_hours_by_crew(sb, current_user["company_id"])}
+
+
 @router.get("/projection/{flight_id}/{crew_id}")
 async def assignment_projection(flight_id: str, crew_id: str,
                                 current_user: CurrentUser, sb: SbClient):
@@ -2202,3 +2214,207 @@ async def replace_assignment(assignment_id: str, data: dict,
         "acceptance_status": "pending_acceptance",
         "gd_review": (flight.get("roster_finalized_status") == "finalized"),
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pending-acceptance reminders (تذكير الموافقات المعلّقة)
+# Published, non-cancelled, still-upcoming flights only. Two tiers by time to
+# departure: gentle (≤48h out, max one per 24h per member/flight) and URGENT
+# (≤6h out, once per member/flight) — plus ONE follow-up alert to schedulers/
+# ops per flight per 6h while pending acceptances remain. Dedupe is read from
+# the notifications table itself (no new tables, naturally idempotent).
+# Accept/decline/admin-confirm logic and the publish/finalize/GD gates are
+# untouched — this only NUDGES.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ACCEPT_REMIND_GENTLE_HOURS = 48     # look-ahead for the gentle tier
+_ACCEPT_REMIND_URGENT_HOURS = 6      # strong tier + ops follow-up
+_ACCEPT_REMIND_COOLDOWN_HOURS = 24   # max one gentle nudge per member per day
+_ACCEPT_FOLLOWUP_COOLDOWN_HOURS = 6  # max one ops follow-up per flight per 6h
+_ACCEPT_FOLLOWUP_ROLES = ("admin", "super_admin", "ops_manager",
+                          "scheduler", "scheduler_admin")
+_T_GENTLE = "assignment_acceptance_reminder"
+_T_URGENT = "assignment_acceptance_urgent"
+_T_FOLLOWUP = "acceptance_followup"
+
+
+def _scan_company_acceptance_reminders(sb, company_id: str) -> dict:
+    """One company pass. Returns counters; never raises into the caller."""
+    now = datetime.now(timezone.utc)
+    horizon = now + timedelta(hours=_ACCEPT_REMIND_GENTLE_HOURS)
+    flights = (sb.table("flights").select("*")
+               .eq("company_id", company_id)
+               .eq("publish_status", "published")
+               .neq("status", "cancelled")
+               .gte("departure_time", now.isoformat())
+               .lte("departure_time", horizon.isoformat())
+               .execute().data) or []
+    out = {"flights_checked": len(flights), "gentle_sent": 0,
+           "urgent_sent": 0, "ops_alerts": 0, "deduped": 0}
+    if not flights:
+        return out
+    fids = [f["id"] for f in flights if f.get("id")]
+
+    asgs = (sb.table("assignments").select("*")
+            .in_("flight_id", fids).execute().data) or []
+    pending_by_flight: dict = {}
+    for a in asgs:
+        if (a.get("duty_type") or "operating") != "operating":
+            continue
+        if _acceptance_status_row(a) != "pending_acceptance":
+            continue
+        pending_by_flight.setdefault(a.get("flight_id"), []).append(a)
+    if not pending_by_flight:
+        return out
+
+    crew_ids = list({a.get("crew_id")
+                     for rows in pending_by_flight.values() for a in rows
+                     if a.get("crew_id")})
+    users = (sb.table("users").select("id, crew_id")
+             .eq("company_id", company_id).eq("is_active", True)
+             .in_("crew_id", crew_ids).execute().data) or []
+    user_by_crew = {u["crew_id"]: u["id"] for u in users if u.get("crew_id")}
+    crew_rows = (sb.table("crew").select("id, full_name_ar, full_name_en")
+                 .in_("id", crew_ids).execute().data) or []
+    name_by_crew = {c["id"]: (c.get("full_name_ar") or c.get("full_name_en")
+                              or c["id"]) for c in crew_rows}
+
+    # Dedupe from prior reminder notifications (window = the widest cooldown).
+    lookback = (now - timedelta(hours=_ACCEPT_REMIND_GENTLE_HOURS)).isoformat()
+    # NOTE: no company filter here — _insert_role_notifications rows carry no
+    # company_id; scoping comes from matching (user, flight) keys below.
+    prior = (sb.table("notifications")
+             .select("user_id, related_flight_id, type, created_at")
+             .in_("type", [_T_GENTLE, _T_URGENT, _T_FOLLOWUP])
+             .gte("created_at", lookback).execute().data) or []
+    gentle_cut = (now - timedelta(hours=_ACCEPT_REMIND_COOLDOWN_HOURS)).isoformat()
+    follow_cut = (now - timedelta(hours=_ACCEPT_FOLLOWUP_COOLDOWN_HOURS)).isoformat()
+    gentle_recent = {(p.get("user_id"), p.get("related_flight_id"))
+                     for p in prior if p.get("type") == _T_GENTLE
+                     and str(p.get("created_at") or "") >= gentle_cut}
+    urgent_ever = {(p.get("user_id"), p.get("related_flight_id"))
+                   for p in prior if p.get("type") == _T_URGENT}
+    follow_recent = {p.get("related_flight_id") for p in prior
+                     if p.get("type") == _T_FOLLOWUP
+                     and str(p.get("created_at") or "") >= follow_cut}
+
+    now_iso = now.isoformat()
+
+    def _send(uid, crew_id, flight, ntype, t_ar, t_en, m_ar, m_en):
+        sb.table("notifications").insert({
+            "id": str(uuid.uuid4()), "user_id": uid, "target_user_id": uid,
+            "company_id": company_id, "type": ntype,
+            "title_ar": t_ar, "title_en": t_en,
+            "message_ar": m_ar, "message_en": m_en,
+            "body_ar": m_ar, "body_en": m_en,
+            "reference_id": flight["id"], "reference_type": "flight",
+            "related_flight_id": flight["id"], "related_crew_id": crew_id,
+            "is_read": False, "created_at": now_iso, "updated_at": now_iso,
+        }).execute()
+        try:
+            push_service.send_to_users(sb, [uid], title=t_ar, body=m_ar,
+                                       data={"type": ntype,
+                                             "flight_id": flight["id"]})
+        except Exception:
+            logger.exception("reminder push failed for %s", uid)
+
+    for f in flights:
+        rows = pending_by_flight.get(f.get("id")) or []
+        if not rows:
+            continue
+        try:
+            dep = datetime.fromisoformat(
+                str(f["departure_time"]).replace("Z", "+00:00"))
+        except (KeyError, ValueError, TypeError):
+            continue
+        hours_left = (dep - now).total_seconds() / 3600.0
+        urgent = hours_left <= _ACCEPT_REMIND_URGENT_HOURS
+        fnum = f.get("flight_number", "")
+        o, d = f.get("origin_code", ""), f.get("destination_code", "")
+
+        pending_names = []
+        for a in rows:
+            cid = a.get("crew_id")
+            pending_names.append(name_by_crew.get(cid, cid))
+            uid = user_by_crew.get(cid)
+            if not uid:
+                continue
+            key = (uid, f.get("id"))
+            if urgent:
+                if key in urgent_ever:
+                    out["deduped"] += 1
+                    continue
+                urgent_ever.add(key)
+                _send(uid, cid, f, _T_URGENT,
+                      f"🔴 عاجل — رحلتك {fnum} خلال أقل من 6 ساعات",
+                      f"URGENT — flight {fnum} departs in <6h",
+                      f"رحلة {fnum} ({o} → {d}) تقلع قريباً ولم تؤكد موافقتك "
+                      f"بعد — أكّد فوراً من بوابة الطاقم أو أبلغ المجدول.",
+                      f"Flight {fnum} ({o} → {d}) departs soon and you have "
+                      f"not responded — confirm now or contact scheduling.")
+                out["urgent_sent"] += 1
+            else:
+                if key in gentle_recent:
+                    out["deduped"] += 1
+                    continue
+                gentle_recent.add(key)
+                _send(uid, cid, f, _T_GENTLE,
+                      f"تذكير — تكليف بانتظار موافقتك: رحلة {fnum}",
+                      f"Reminder — duty awaiting your response: {fnum}",
+                      f"كُلّفت برحلة {fnum} ({o} → {d}) ولم تردّ بعد — "
+                      f"يرجى الموافقة أو الرفض من بوابة الطاقم.",
+                      f"You are rostered on {fnum} ({o} → {d}) and have not "
+                      f"responded — please accept or decline.")
+                out["gentle_sent"] += 1
+
+        # Near departure + still pending → ONE follow-up to schedulers/ops.
+        if urgent and f.get("id") not in follow_recent:
+            try:
+                from app.api.v1.endpoints.flights import _insert_role_notifications
+                _insert_role_notifications(
+                    sb, company_id, _ACCEPT_FOLLOWUP_ROLES, _T_FOLLOWUP,
+                    f"متابعة — موافقات معلّقة قبيل رحلة {fnum}",
+                    f"Follow-up — pending acceptances before {fnum}",
+                    f"رحلة {fnum} ({o} → {d}) تقلع خلال "
+                    f"{max(0, int(hours_left))} ساعة وما زال بانتظار الموافقة: "
+                    f"{'، '.join(pending_names)} — تحتاج متابعة أو استبدالاً.",
+                    f"{fnum} departs in ~{max(0, int(hours_left))}h with "
+                    f"pending acceptances: {', '.join(pending_names)}.",
+                    f["id"])
+                follow_recent.add(f.get("id"))
+                out["ops_alerts"] += 1
+            except Exception:
+                logger.exception("acceptance follow-up failed for %s", f.get("id"))
+    return out
+
+
+@router.post("/acceptance-reminders/run")
+async def run_acceptance_reminders(current_user: CurrentUser, sb: SbClient):
+    """Manual trigger (supervisors) — pending-acceptance reminders for THIS
+    company only."""
+    if current_user.get("role") not in ("admin", "super_admin", "ops_manager",
+                                        "scheduler_admin") \
+            and not current_user.get("is_superuser"):
+        raise ForbiddenError("الإدمن / مدير العمليات / مشرف الجدولة فقط")
+    return _scan_company_acceptance_reminders(sb, current_user["company_id"])
+
+
+@router.get("/cron/acceptance-reminders", status_code=200)
+async def cron_acceptance_reminders(sb: SbClient,
+                                    authorization: Optional[str] = Header(default=None)):
+    """Scheduled trigger (Vercel Cron → GET, `Authorization: Bearer
+    $CRON_SECRET`) — runs the scan for EVERY active company."""
+    secret = getattr(settings, "CRON_SECRET", "") or ""
+    if not secret or authorization != f"Bearer {secret}":
+        raise ForbiddenError("Invalid cron credentials")
+    companies = (sb.table("companies").select("id")
+                 .eq("is_active", True).execute().data) or []
+    results = {}
+    for c in companies:
+        try:
+            results[c["id"]] = _scan_company_acceptance_reminders(sb, c["id"])
+        except Exception as e:
+            logger.warning("acceptance cron failed for company %s: %s",
+                           c.get("id"), e)
+            results[c["id"]] = {"error": str(e)[:120]}
+    return {"companies": len(companies), "results": results}

@@ -289,12 +289,21 @@ def test_publish_notifies_pending_crew(monkeypatch):
                      "flight_number": "IA-1", "aircraft_registration": "YI-ASU",
                      "departure_time": "2099-01-01T10:00:00+00:00",
                      "origin_code": "BGW", "destination_code": "EBL"}],
-        "assignments": [{"id": "a1", "flight_id": "f1", "crew_id": "cr1"}],
+        # Full mandatory complement — publish now enforces the min-crew gate.
+        "assignments": [{"id": "a1", "flight_id": "f1", "crew_id": "cr1",
+                         "duty_type": "operating"}] +
+                       [{"id": f"a{i+2}", "flight_id": "f1", "crew_id": c,
+                         "duty_type": "operating"}
+                        for i, c in enumerate(("p1", "p2", "cc2", "cc3"))],
         "users": [{"id": "u_cr1", "crew_id": "cr1", "role": "crew",
                    "company_id": "c1", "is_active": True},
                   {"id": "u_al", "role": "cabin_allocator",
                    "company_id": "c1", "is_active": True}],
-        "crew": [{"id": "cr1", "full_name_ar": "زها"}],
+        "crew": [{"id": "cr1", "full_name_ar": "زها", "rank": "cabin_crew"},
+                 {"id": "p1", "rank": "captain"},
+                 {"id": "p2", "rank": "first_officer"},
+                 {"id": "cc2", "rank": "cabin_crew"},
+                 {"id": "cc3", "rank": "cabin_crew"}],
         "notification_delivery": [],
     }
     from app.api.v1.endpoints.flights import publish_flight

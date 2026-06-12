@@ -3,6 +3,7 @@ from typing import Optional
 from datetime import datetime, timezone, date
 from fastapi import APIRouter, Query, HTTPException
 from app.api.deps import SbClient, CurrentUser
+from app.core.audit import write_audit
 from app.core.exceptions import NotFoundError, ConflictError, ForbiddenError
 from app.core.config import settings
 from app.core.security import get_password_hash
@@ -493,15 +494,100 @@ async def reset_crew_account_password(crew_id: str, current_user: CurrentUser, s
 
 @router.delete("/{crew_id}", status_code=204)
 async def delete_crew(crew_id: str, current_user: CurrentUser, sb: SbClient):
-    """Delete a crew member. Admin only."""
+    """Delete a crew member. Admin only.
+
+    Deleting the member cascades into deleting ALL their assignments — a crew
+    member must never silently vanish from a live roster, so each removed
+    assignment is audited (reason: crew_deleted), GD-finalised flights are
+    marked stale (same hook as remove/replace), and schedulers/ops are alerted
+    for every published/finalised flight that lost a member."""
     if current_user["role"] not in ("super_admin", "admin"):
         raise ForbiddenError("Admin access required")
-    existing = sb.table("crew").select("id").eq("id", crew_id).eq("company_id", current_user["company_id"]).execute()
+    cid = current_user["company_id"]
+    existing = sb.table("crew").select("id, full_name_ar, full_name_en") \
+        .eq("id", crew_id).eq("company_id", cid).execute()
     if not existing.data:
         raise NotFoundError("Crew member", crew_id)
+    crew_name = existing.data[0].get("full_name_ar") \
+        or existing.data[0].get("full_name_en") or crew_id
+
+    # Snapshot the assignments + their flights BEFORE anything is deleted.
+    asgs = sb.table("assignments").select("*").eq("crew_id", crew_id) \
+        .execute().data or []
+    flights_by_id: dict = {}
+    fids = [a.get("flight_id") for a in asgs if a.get("flight_id")]
+    if fids:
+        rows = sb.table("flights").select(
+            "id, flight_number, origin_code, destination_code, "
+            "publish_status, roster_finalized_status, gd_status") \
+            .in_("id", fids).eq("company_id", cid).execute().data or []
+        flights_by_id = {r["id"]: r for r in rows}
+
     # Remove assignments first to avoid FK violations
     sb.table("assignments").delete().eq("crew_id", crew_id).execute()
     sb.table("crew").delete().eq("id", crew_id).execute()
+
+    # ── Protection trail (best-effort — must never fail the delete itself) ──
+    log = logging.getLogger(__name__)
+    affected_live: list = []
+    for a in asgs:
+        fl = flights_by_id.get(a.get("flight_id")) or {}
+        try:
+            sb.table("audit_log").insert({
+                "user_id": current_user["id"],
+                "user_name": current_user.get("name_ar")
+                             or current_user.get("name_en")
+                             or current_user.get("email", ""),
+                "action": "assignment_removed_by_crew_delete",
+                "entity_type": "assignment",
+                "entity_id": a.get("id"),
+                "company_id": cid,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "after_data": json.dumps({
+                    "crew_id": crew_id,
+                    "crew_name": crew_name,
+                    "flight_id": a.get("flight_id"),
+                    "flight_number": fl.get("flight_number"),
+                    "assignment_id": a.get("id"),
+                    "reason": "crew_deleted",
+                    "duty_type": a.get("duty_type"),
+                    "assigned_role": a.get("assigned_role"),
+                    "publish_status": fl.get("publish_status"),
+                    "roster_finalized_status": fl.get("roster_finalized_status"),
+                }, ensure_ascii=False),
+            }).execute()
+        except Exception:
+            log.exception("audit failed for crew-delete assignment %s", a.get("id"))
+        # Same staleness hook the remove/replace paths use.
+        if fl.get("roster_finalized_status") == "finalized":
+            try:
+                from app.api.v1.endpoints.flights import mark_gd_stale_if_finalized
+                mark_gd_stale_if_finalized(sb, cid, fl["id"], actor=current_user)
+            except Exception:
+                log.exception("gd-stale hook failed for %s", fl.get("id"))
+        if fl and (fl.get("publish_status") == "published"
+                   or fl.get("roster_finalized_status") == "finalized"):
+            affected_live.append(fl)
+
+    # One alert per affected LIVE flight — the roster lost a member.
+    for fl in affected_live:
+        try:
+            from app.api.v1.endpoints.flights import _insert_role_notifications
+            fnum = fl.get("flight_number", "")
+            o, d = fl.get("origin_code", ""), fl.get("destination_code", "")
+            _insert_role_notifications(
+                sb, cid,
+                ("admin", "super_admin", "ops_manager", "scheduler", "scheduler_admin"),
+                "roster_changed",
+                f"حذف فرد مكلّف برحلة {fnum}",
+                f"Assigned crew deleted — {fnum}",
+                f"حُذف {crew_name} من النظام وكان مكلّفاً برحلة {fnum} ({o} → {d}) — "
+                f"راجع الجدول وعيّن بديلاً وأعد توليد GD إن كان مولّداً.",
+                f"{crew_name} was deleted and held a duty on {fnum} — review the "
+                f"roster, assign a replacement, regenerate GD if needed.",
+                fl["id"])
+        except Exception:
+            log.exception("crew-delete alert failed for flight %s", fl.get("id"))
 
 
 @router.get("/{crew_id}/flights")
@@ -592,6 +678,11 @@ async def block_crew(crew_id: str, data: dict, current_user: CurrentUser, sb: Sb
         "blocked_on": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", crew_id).execute()
+    # Blocking grounds a member — first-class governance event.
+    write_audit(sb, current_user, "crew_blocked", "crew", crew_id,
+                before={"status": "active"},
+                after={"status": "blocked"},
+                reason=data.get("reason"))
     return result.data[0] if result.data else {}
 
 
@@ -609,6 +700,8 @@ async def unblock_crew(crew_id: str, current_user: CurrentUser, sb: SbClient):
         "blocked_on": None,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", crew_id).execute()
+    write_audit(sb, current_user, "crew_unblocked", "crew", crew_id,
+                before={"status": "blocked"}, after={"status": "active"})
     return result.data[0] if result.data else {}
 
 

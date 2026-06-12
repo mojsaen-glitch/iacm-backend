@@ -20,8 +20,27 @@ from datetime import datetime, timedelta, timezone
 from app.core.crew_roles import role_category, role_code, CAT_FLIGHT_DECK, CAT_CABIN
 from app.core.exceptions import NotFoundError
 
-# Every credited hour is traceable back to this source column.
-HOURS_SOURCE = "flights.duration_hours"
+# Every credited hour is traceable back to this source. Phase-1 of the
+# actual-hours model: ACTUAL block (ATA − ATD) when OCC recorded both, else
+# the scheduled duration_hours — an explicit per-leg Planned→Actual fallback.
+HOURS_SOURCE = "flights.actual(ATA−ATD) → flights.duration_hours"
+
+
+def _leg_hours(f: dict) -> tuple[float, bool]:
+    """(hours, is_actual) for one leg. ACTUAL only when BOTH ATD and ATA are
+    recorded and positive; anything else falls back to the scheduled block —
+    old rows (no actual columns) behave exactly as before."""
+    atd, ata = f.get("actual_departure_time"), f.get("actual_arrival_time")
+    if atd and ata:
+        try:
+            d = datetime.fromisoformat(str(atd).replace("Z", "+00:00"))
+            a = datetime.fromisoformat(str(ata).replace("Z", "+00:00"))
+            h = (a - d).total_seconds() / 3600.0
+            if h > 0:
+                return round(h, 2), True
+        except (ValueError, TypeError):
+            pass
+    return float(f.get("duration_hours") or 0), False
 
 # Official monthly reports follow the BAGHDAD calendar (+03:00), not UTC — a
 # red-eye departing 01:00 Baghdad on the 1st belongs to the NEW month. This is
@@ -158,7 +177,8 @@ def crew_flight_hours(sb, company_id: str, crew_id: str, dh_credit=None) -> dict
         # Cancelled flights never credit hours — excluded at the ENGINE level so
         # every consumer (matrix / Excel / crew profile) agrees.
         for f in _fetch_all(lambda ch=chunk: sb.table("flights")
-                            .select("id, departure_time, duration_hours")
+                            .select("id, departure_time, duration_hours, "
+                                    "actual_departure_time, actual_arrival_time")
                             .eq("company_id", company_id)
                             .neq("status", "cancelled").in_("id", ch)):
             flight_by_id[f["id"]] = f
@@ -195,7 +215,7 @@ def crew_flight_hours(sb, company_id: str, crew_id: str, dh_credit=None) -> dict
             continue
         dt = _as_naive_utc(dt)
         credited = _credited_hours(a.get("duty_type") or "operating",
-                                   float(f.get("duration_hours") or 0), dh_factor)
+                                   _leg_hours(f)[0], dh_factor)
         if credited <= 0:
             continue
         total += credited
@@ -235,7 +255,8 @@ def month_hours_by_crew(sb, company_id: str, dh_credit=None) -> dict[str, float]
                                            second=0, microsecond=0) - _BAGHDAD
     rows = _fetch_all(lambda: sb.table("assignments")
                       .select("crew_id, duty_type, "
-                              "flights!inner(duration_hours, departure_time, status)")
+                              "flights!inner(duration_hours, departure_time, status, "
+                              "actual_departure_time, actual_arrival_time)")
                       .eq("flights.company_id", company_id)
                       .neq("flights.status", "cancelled")
                       .gte("flights.departure_time", month_start.isoformat()))
@@ -247,7 +268,7 @@ def month_hours_by_crew(sb, company_id: str, dh_credit=None) -> dict[str, float]
             continue
         out[cid] = out.get(cid, 0.0) + _credited_hours(
             r.get("duty_type") or "operating",
-            float(f.get("duration_hours") or 0), dh)
+            _leg_hours(f)[0], dh)
     return {k: round(v, 2) for k, v in out.items()}
 
 
@@ -293,7 +314,8 @@ def build_matrix(sb, company_id: str, year: int, month: int, filters: dict | Non
     # hours nor appear as duty cells (matrix + Excel + analytics stay agreed).
     flights = _fetch_all(lambda: sb.table("flights").select(
         "id, flight_number, origin_code, destination_code, departure_time, "
-        "arrival_time, duration_hours, aircraft_type, aircraft_id"
+        "arrival_time, duration_hours, aircraft_type, aircraft_id, "
+        "actual_departure_time, actual_arrival_time"
     ).eq("company_id", company_id).neq("status", "cancelled")
      .gte("departure_time", start).lt("departure_time", end))
     flight_by_id = {f["id"]: f for f in flights}
@@ -347,7 +369,7 @@ def build_matrix(sb, company_id: str, year: int, month: int, filters: dict | Non
         day = (dt + _BAGHDAD).day      # day cell follows the BAGHDAD calendar
         sta = _parse_dt(f.get("arrival_time"))
         duty = a.get("duty_type") or "operating"
-        duration = float(f.get("duration_hours") or 0)
+        duration, is_actual = _leg_hours(f)   # ACTUAL block when ATD+ATA recorded
         credited = _credited_hours(duty, duration, dh_factor)
         reg = reg_by_ac.get(f.get("aircraft_id"), "")
 
@@ -366,6 +388,7 @@ def build_matrix(sb, company_id: str, year: int, month: int, filters: dict | Non
             "registration": reg,
             "flight_id": f.get("id"),
             "assignment_id": a.get("id"),
+            "actual": is_actual,            # Planned vs Actual, never mixed silently
         }
         d = row["days"].setdefault(str(day), {"legs": [], "day_hours": 0.0})
         d["legs"].append(leg)
@@ -666,7 +689,8 @@ def build_statement(sb, company_id: str, crew_id: str, year: int, month: int,
         flights.extend(_fetch_all(
             lambda ch=chunk: sb.table("flights").select(
                 "id, flight_number, origin_code, destination_code, departure_time, "
-                "arrival_time, duration_hours, aircraft_type, aircraft_id")
+                "arrival_time, duration_hours, aircraft_type, aircraft_id, "
+                "actual_departure_time, actual_arrival_time")
             .eq("company_id", company_id).neq("status", "cancelled")
             .gte("departure_time", start)
             .lt("departure_time", end).in_("id", ch)))
@@ -691,7 +715,7 @@ def build_statement(sb, company_id: str, crew_id: str, year: int, month: int,
             continue
         sta = _parse_dt(f.get("arrival_time"))
         duty = a.get("duty_type") or "operating"
-        duration = float(f.get("duration_hours") or 0)
+        duration, is_actual = _leg_hours(f)   # ACTUAL block when ATD+ATA recorded
         included, credited, reason, incomplete = _inclusion(duty, duration, dh_factor)
         day = (dt + _BAGHDAD).day      # day cell follows the BAGHDAD calendar
         legs.append({
@@ -704,10 +728,14 @@ def build_statement(sb, company_id: str, crew_id: str, year: int, month: int,
             "registration": reg_by_ac.get(f.get("aircraft_id"), ""),
             "std": dt.strftime("%H:%M"), "sta": sta.strftime("%H:%M") if sta else "",
             "duration_hours": round(duration, 2),
+            "hours_source": "actual" if is_actual else "scheduled",
             "credited_hours": credited,
             "included": included,
             "reason": reason,
-            "source": HOURS_SOURCE,
+            # Per-leg traceability: actual legs name the ATD/ATA source;
+            # scheduled legs keep the historical value (back-compat).
+            "source": "flights.actual(ATA-ATD)" if is_actual
+                      else "flights.duration_hours",
             "flight_id": f.get("id"), "assignment_id": a.get("id"),
             "incomplete": incomplete,
         })

@@ -13,6 +13,7 @@ import uuid
 from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, HTTPException
 from app.api.deps import SbClient, CurrentUser
+from app.core.audit import write_audit
 from app.core.exceptions import ForbiddenError, NotFoundError
 from app.services import push_service
 from app.api.v1.endpoints.flights import (
@@ -666,14 +667,17 @@ async def occ_flight_crew(flight_id: str, current_user: CurrentUser, sb: SbClien
     Drives the crew-revalidation badge after a Change Aircraft."""
     _ensure_occ_reader(current_user)
     cid = current_user["company_id"]
-    res = (sb.table("flights").select("id,flight_number,aircraft_type,aircraft_registration")
+    res = (sb.table("flights").select("id,flight_number,aircraft_type,aircraft_registration,"
+                                       "actual_departure_time,actual_arrival_time")
            .eq("id", flight_id).eq("company_id", cid).execute())
     if not res.data:
         raise NotFoundError("Flight", flight_id)
     flight = res.data[0]
     ac_type = flight.get("aircraft_type") or ""
 
-    asg = (sb.table("assignments").select("crew_id, duty_type")
+    # select * — the drawer's Replace action needs assignment_id, and the row
+    # chips need the acceptance fields (status derived below).
+    asg = (sb.table("assignments").select("*")
            .eq("flight_id", flight_id).execute().data) or []
     crew_ids = [a["crew_id"] for a in asg if a.get("crew_id")]
     by_id: dict = {}
@@ -682,6 +686,7 @@ async def occ_flight_crew(flight_id: str, current_user: CurrentUser, sb: SbClien
         for c in (sb.table("crew").select(cols).in_("id", crew_ids).execute().data or []):
             by_id[c["id"]] = c
 
+    from app.api.v1.endpoints.assignments import _acceptance_status_row
     crew = []
     unqualified = 0
     for a in asg:
@@ -696,6 +701,8 @@ async def occ_flight_crew(flight_id: str, current_user: CurrentUser, sb: SbClien
             unqualified += 1
         crew.append({
             "crew_id": ccid,
+            "assignment_id": a.get("id"),
+            "acceptance_status": _acceptance_status_row(a),
             "name_ar": (c.get("full_name_ar") or "").strip(),
             "name_en": (c.get("full_name_en") or "").strip(),
             "rank": c.get("rank") or "",
@@ -709,7 +716,111 @@ async def occ_flight_crew(flight_id: str, current_user: CurrentUser, sb: SbClien
         "flight_number": flight.get("flight_number", ""),
         "aircraft_type": ac_type,
         "aircraft_registration": flight.get("aircraft_registration") or "",
+        "actual_departure_time": flight.get("actual_departure_time"),
+        "actual_arrival_time": flight.get("actual_arrival_time"),
         "crew_review_required": unqualified > 0,
         "unqualified_crew": unqualified,
         "crew": crew,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Actual movement times — ATD/ATA (Phase 1 of the actual-hours model)
+# An INDEPENDENT layer: STD/STA stay the schedule, ETD/ETA stay the delay
+# estimate. Recorded EXPLICITLY here (never auto-written by status changes).
+# First recording: reason optional. EDITING a recorded value: reason MANDATORY.
+# Reports use actual when both ATD+ATA exist, scheduled as fallback (engine
+# `_leg_hours`). Pre-flight FTL/FDP and the GD gates are untouched.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_actual(value, label):
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422,
+                            detail=f"صيغة وقت غير صالحة لـ {label}")
+
+
+@router.post("/flights/{flight_id}/actual-times")
+async def record_actual_times(flight_id: str, data: dict,
+                              current_user: CurrentUser, sb: SbClient):
+    """Record or correct ATD/ATA for a flight (OCC action)."""
+    if current_user.get("role") not in _OCC_DELAY_ROLES \
+            and not current_user.get("is_superuser"):
+        raise ForbiddenError("تسجيل الأوقات الفعلية يتطلب صلاحية عمليات/OCC")
+    cid = current_user["company_id"]
+
+    res = (sb.table("flights").select("*")
+           .eq("id", flight_id).eq("company_id", cid).execute())
+    if not res.data:
+        raise NotFoundError("Flight", flight_id)
+    flight = res.data[0]
+    if "actual_departure_time" not in flight:
+        raise HTTPException(
+            status_code=422,
+            detail="يلزم تشغيل ترحيل قاعدة البيانات "
+                   "(migrations/2026_06_12_flight_actual_times.sql)")
+
+    atd_in = data.get("atd")
+    ata_in = data.get("ata")
+    reason = (data.get("reason") or "").strip()
+    if atd_in is None and ata_in is None:
+        raise HTTPException(status_code=422, detail="أرسل atd و/أو ata")
+
+    before = {"atd": flight.get("actual_departure_time"),
+              "ata": flight.get("actual_arrival_time")}
+    update: dict = {}
+    editing = False   # changing an already-recorded value ⇒ reason mandatory
+
+    if atd_in is not None:
+        atd_dt = _parse_actual(atd_in, "ATD")
+        new_atd = atd_dt.isoformat()
+        if before["atd"] and str(before["atd"]) != new_atd:
+            editing = True
+        update["actual_departure_time"] = new_atd
+    if ata_in is not None:
+        ata_dt = _parse_actual(ata_in, "ATA")
+        new_ata = ata_dt.isoformat()
+        if before["ata"] and str(before["ata"]) != new_ata:
+            editing = True
+        update["actual_arrival_time"] = new_ata
+
+    # ATA must follow ATD (whichever pair results after this update).
+    final_atd = update.get("actual_departure_time", before["atd"])
+    final_ata = update.get("actual_arrival_time", before["ata"])
+    if final_atd and final_ata:
+        if _parse_actual(final_ata, "ATA") <= _parse_actual(final_atd, "ATD"):
+            raise HTTPException(status_code=422,
+                                detail="ATA يجب أن يكون بعد ATD")
+
+    if editing and not reason:
+        raise HTTPException(status_code=422,
+                            detail="تعديل وقت فعلي مسجَّل يتطلب سبباً")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    update["actual_times_updated_by"] = current_user["id"]
+    update["actual_times_updated_at"] = now_iso
+    update["updated_at"] = now_iso
+    sb.table("flights").update(update).eq("id", flight_id).execute()
+
+    after = {"atd": final_atd, "ata": final_ata}
+    write_audit(sb, current_user,
+                "actual_times_updated" if editing else "actual_times_recorded",
+                "flight", flight_id,
+                before=before,
+                after={**after, "flight_number": flight.get("flight_number")},
+                reason=reason or None)
+
+    actual_block = None
+    if final_atd and final_ata:
+        actual_block = round(
+            (_parse_actual(final_ata, "ATA") - _parse_actual(final_atd, "ATD"))
+            .total_seconds() / 3600.0, 2)
+    return {
+        "flight_id": flight_id,
+        "flight_number": flight.get("flight_number"),
+        "atd": final_atd,
+        "ata": final_ata,
+        "actual_block_hours": actual_block,
+        "edited": editing,
     }

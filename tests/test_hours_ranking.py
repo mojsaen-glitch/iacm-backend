@@ -76,6 +76,21 @@ def test_irops_falls_back_to_stored_when_batch_fails(monkeypatch):
     assert order == ["A", "B"]            # graceful fallback: stored 0 < 99
 
 
+# ── /assignments/month-hours: the auto-assign fairness feed ──────────────────
+def test_month_hours_endpoint_returns_report_policy_map(monkeypatch):
+    """ONE batch endpoint wrapping month_hours_by_crew (operating only,
+    cancelled excluded, Baghdad month) — no per-crew calls."""
+    import app.core.monthly_hours as mh
+    from app.api.v1.endpoints.assignments import month_hours
+    calls = []
+    monkeypatch.setattr(mh, "month_hours_by_crew",
+                        lambda sb, cid, dh_credit=None:
+                        calls.append(cid) or {"c1": 3.0, "c2": 0.5})
+    res = asyncio.run(month_hours(current_user=OPS, sb=FakeSb({})))
+    assert res == {"hours": {"c1": 3.0, "c2": 0.5}}
+    assert calls == ["c1"]                  # company-scoped, single batch
+
+
 # ── Projection: hours come from the ENGINE, not crew.monthly_flight_hours ────
 class _StubEngine:
     def __init__(self, sb): pass

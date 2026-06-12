@@ -1,5 +1,14 @@
 -- IACM Database Schema - Run this in Supabase SQL Editor
 -- https://supabase.com/dashboard/project/hfqwzibamphaphdkjpue/sql/new
+--
+-- REFERENCE SNAPSHOT (consolidated 2026-06): this file is the authoritative
+-- starting point for a NEW environment and the reference for the CORE tables.
+-- Production evolved through migrations/*.sql — feature tables (standby,
+-- device_tokens, irops_*, om_*, safety, payroll, maintenance,
+-- crew_hours_overrides, metrics, fdp_rules, operator companies registry …)
+-- live there and are NOT duplicated here. Columns marked "-- + feature"
+-- below were added after the original schema and are part of production.
+-- Guarded by tests/test_schema_reference.py — update BOTH together.
 
 -- Companies
 CREATE TABLE IF NOT EXISTS companies (
@@ -36,6 +45,9 @@ CREATE TABLE IF NOT EXISTS users (
     is_superuser BOOLEAN DEFAULT false,
     last_login TIMESTAMPTZ,
     refresh_token TEXT,
+    totp_secret TEXT,                                  -- + 2FA (2026_06_21_users_totp)
+    totp_enabled BOOLEAN NOT NULL DEFAULT false,       -- + 2FA
+    totp_enrolled_at TIMESTAMPTZ,                      -- + 2FA
     created_at TIMESTAMPTZ DEFAULT now(),
     updated_at TIMESTAMPTZ DEFAULT now()
 );
@@ -75,9 +87,14 @@ CREATE TABLE IF NOT EXISTS crew (
     rest_hours_due FLOAT DEFAULT 0,
     available_from TIMESTAMPTZ,
     max_monthly_hours FLOAT DEFAULT 100,
+    passport_number TEXT,                              -- + GenDec PP NO (gd-clearance checks it)
+    operator_company_id TEXT REFERENCES companies(id), -- + wet-lease operator (2026_06_04)
     created_at TIMESTAMPTZ DEFAULT now(),
     updated_at TIMESTAMPTZ DEFAULT now()
 );
+-- NOTE: monthly_flight_hours / yearly_flight_hours / last_28day_hours are NOT
+-- maintained by the backend — real hours are COMPUTED (monthly_hours.py /
+-- compliance engine). Kept only as legacy emergency fallbacks.
 
 -- Documents
 CREATE TABLE IF NOT EXISTS documents (
@@ -149,6 +166,31 @@ CREATE TABLE IF NOT EXISTS flights (
     delay_reason TEXT,
     gate TEXT,
     notes TEXT,
+    aircraft_registration TEXT,                        -- + REG (mandatory at create; GD needs the tail)
+    operator_company_id TEXT REFERENCES companies(id), -- + wet-lease operator (2026_06_04)
+    -- + OCC advanced delay (ETD ≠ STD; reason codes + audit fields)
+    estimated_departure_time TIMESTAMPTZ,
+    delay_reason_code TEXT,
+    delay_notes TEXT,
+    delay_updated_at TIMESTAMPTZ,
+    delay_updated_by TEXT,
+    -- + cancellation trail (2026_05_17_flight_cancellation_reason)
+    cancellation_reason TEXT,
+    cancellation_notes TEXT,
+    -- + roster lifecycle (2026_06_01_roster_finalize)
+    roster_finalized_status TEXT,                      -- 'finalized' | NULL
+    roster_finalized_at TIMESTAMPTZ,
+    roster_finalized_by TEXT REFERENCES users(id),
+    -- + GD lifecycle (applied ad-hoc with the lifecycle-badge feature):
+    --   'ready' on finalize, 'stale' when crew/flight changes afterwards.
+    gd_status TEXT,
+    gd_version INT DEFAULT 0,
+    -- + actual movement times (2026_06_12_flight_actual_times) — OCC-recorded
+    --   ATD/ATA layer; reports use actual when present, scheduled as fallback.
+    actual_departure_time TIMESTAMPTZ,
+    actual_arrival_time TIMESTAMPTZ,
+    actual_times_updated_by TEXT,
+    actual_times_updated_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ DEFAULT now(),
     updated_at TIMESTAMPTZ DEFAULT now()
 );
@@ -164,6 +206,18 @@ CREATE TABLE IF NOT EXISTS assignments (
     acknowledged_at TIMESTAMPTZ,
     is_override BOOLEAN DEFAULT false,
     override_reason TEXT,
+    assigned_role TEXT,                                -- + rank snapshot (2026_06_03)
+    duty_type TEXT NOT NULL DEFAULT 'operating',       -- + operating|deadhead|standby|observer|training (2026_06_15)
+    operator_company_id TEXT REFERENCES companies(id), -- + wet-lease operator (2026_06_04)
+    -- + crew acceptance: decline (2026_05_17) + supervisory admin-confirm (2026_06_11).
+    --   Acceptance status is DERIVED: declined > admin_confirmed > accepted(acknowledged) > pending.
+    declined BOOLEAN DEFAULT false,
+    decline_reason TEXT,
+    declined_at TIMESTAMPTZ,
+    admin_confirmed BOOLEAN DEFAULT false,
+    admin_confirmed_by TEXT,
+    admin_confirmed_at TIMESTAMPTZ,
+    admin_confirm_reason TEXT,
     UNIQUE(flight_id, crew_id),
     created_at TIMESTAMPTZ DEFAULT now(),
     updated_at TIMESTAMPTZ DEFAULT now()
@@ -176,8 +230,13 @@ CREATE TABLE IF NOT EXISTS notifications (
     title_en TEXT NOT NULL,
     body_ar TEXT,
     body_en TEXT,
+    message_ar TEXT,                                   -- + list-view text (code writes both body_* and message_*)
+    message_en TEXT,                                   -- + list-view text
     type TEXT NOT NULL,
+    user_id TEXT REFERENCES users(id),                 -- + recipient (code writes user_id AND target_user_id)
     target_user_id TEXT REFERENCES users(id),
+    reference_id TEXT,                                 -- + generic entity link (flight/crew/…)
+    reference_type TEXT,                               -- + entity kind for reference_id
     company_id TEXT REFERENCES companies(id),
     related_flight_id TEXT REFERENCES flights(id),
     related_crew_id TEXT REFERENCES crew(id),

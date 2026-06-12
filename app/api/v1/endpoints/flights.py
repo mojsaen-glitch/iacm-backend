@@ -6,6 +6,7 @@ from typing import Optional
 from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, Query, HTTPException, Body
 from app.api.deps import SbClient, CurrentUser
+from app.core.audit import write_audit
 from app.core.exceptions import NotFoundError, ForbiddenError
 from app.core.fleet_complement import (
     category_for_rank, is_captain_rank, min_required_for_category,
@@ -356,6 +357,16 @@ async def create_flight(data: dict, current_user: CurrentUser, sb: SbClient):
     result = sb.table("flights").insert(data).execute()
     created = result.data[0] if result.data else {}
 
+    # Audit — flight creation is the root of the whole scheduling trail.
+    write_audit(sb, current_user, "flight_created", "flight", created.get("id"),
+                after={"flight_number": created.get("flight_number"),
+                       "origin_code": created.get("origin_code"),
+                       "destination_code": created.get("destination_code"),
+                       "departure_time": created.get("departure_time"),
+                       "arrival_time": created.get("arrival_time"),
+                       "aircraft_type": created.get("aircraft_type"),
+                       "aircraft_registration": created.get("aircraft_registration")})
+
     # Notify crew schedulers that a new flight was created so they can begin
     # planning crew assignment. Best-effort — never fail the create on notify.
     try:
@@ -388,12 +399,33 @@ async def get_flight(flight_id: str, current_user: CurrentUser, sb: SbClient):
     return result.data[0]
 
 
+# Operational fields that appear on the GenDec or affect crew legality —
+# editing any of them AFTER roster approval invalidates the issued GD.
+_GD_IMPACT_FIELDS = (
+    "departure_time", "arrival_time", "aircraft_type",
+    "aircraft_registration", "origin_code", "destination_code", "flight_number",
+)
+
+
+def _same_instant(a, b) -> bool:
+    """Timestamps compare as INSTANTS — an edit form resending the same moment
+    in a different ISO shape ('Z' vs '+00:00') must NOT count as a change."""
+    try:
+        pa = datetime.fromisoformat(str(a).replace("Z", "+00:00"))
+        pb = datetime.fromisoformat(str(b).replace("Z", "+00:00"))
+        return pa == pb
+    except (ValueError, TypeError):
+        return str(a or "") == str(b or "")
+
+
 @router.patch("/{flight_id}")
 async def update_flight(flight_id: str, data: dict, current_user: CurrentUser, sb: SbClient):
     _ensure_flight_editor(current_user)
-    existing = sb.table("flights").select("id").eq("id", flight_id).eq("company_id", current_user["company_id"]).execute()
+    # Full row — needed to detect GD-impacting changes after roster approval.
+    existing = sb.table("flights").select("*").eq("id", flight_id).eq("company_id", current_user["company_id"]).execute()
     if not existing.data:
         raise NotFoundError("Flight", flight_id)
+    before = existing.data[0]
 
     # REG can be set/corrected here (movement / ops edit + tail swap). When the
     # caller includes it, it must be a valid, non-empty tail — REG cannot be
@@ -421,7 +453,59 @@ async def update_flight(flight_id: str, data: dict, current_user: CurrentUser, s
 
     data["updated_at"] = datetime.now(timezone.utc).isoformat()
     result = sb.table("flights").update(data).eq("id", flight_id).execute()
-    return result.data[0] if result.data else {}
+    updated_row = result.data[0] if result.data else {}
+
+    # ── GD integrity: editing an operational field AFTER roster approval must
+    # invalidate the issued GD — same hook as remove/replace/OCC (which stales
+    # the GD and alerts Flight Ops). Best-effort: the edit itself never fails
+    # because of this trail. OCC's change-aircraft keeps its own protected path.
+    try:
+        if before.get("roster_finalized_status") == "finalized":
+            changed = {}
+            for f in _GD_IMPACT_FIELDS:
+                if f not in data:
+                    continue
+                old_v, new_v = before.get(f), data.get(f)
+                if f in ("departure_time", "arrival_time"):
+                    if _same_instant(old_v, new_v):
+                        continue
+                elif f == "aircraft_registration":
+                    if _normalize_reg(old_v) == _normalize_reg(new_v):
+                        continue
+                elif str(old_v or "") == str(new_v or ""):
+                    continue
+                changed[f] = {"before": old_v, "after": new_v}
+            if changed:
+                try:
+                    sb.table("audit_log").insert({
+                        "user_id": current_user["id"],
+                        "user_name": current_user.get("name_ar")
+                                     or current_user.get("name_en")
+                                     or current_user.get("email", ""),
+                        "action": "flight_updated_after_finalize",
+                        "entity_type": "flight",
+                        "entity_id": flight_id,
+                        "company_id": current_user["company_id"],
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "before_data": json.dumps(
+                            {f: c["before"] for f, c in changed.items()},
+                            ensure_ascii=False),
+                        "after_data": json.dumps({
+                            "flight_number": before.get("flight_number"),
+                            "changed_fields": changed,
+                            "gd_invalidated": True,
+                        }, ensure_ascii=False),
+                    }).execute()
+                except Exception:
+                    logging.getLogger(__name__).exception(
+                        "audit failed for post-finalize edit %s", flight_id)
+                mark_gd_stale_if_finalized(
+                    sb, current_user["company_id"], flight_id, actor=current_user)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "gd-stale trail failed for update_flight %s", flight_id)
+
+    return updated_row
 
 
 @router.put("/{flight_id}")
@@ -521,9 +605,17 @@ async def publish_flight(flight_id: str, current_user: CurrentUser, sb: SbClient
             detail="لا يمكن نشر الرحلة بدون رقم تسجيل الطائرة (REG). أضِف REG أولاً.",
         )
 
-    # NOTE: publishing only OPENS a flight for crew assignment — it may legally
-    # have no crew yet. The minimum-crew (under-staffing) gate is enforced later,
-    # at roster finalisation (see POST /flights/{id}/finalize-roster).
+    # Mandatory-complement gate (SERVER-side): a roster below its safety floor
+    # (no captain / too few pilots / too few operating cabin crew) must never
+    # reach the crew portal. Same rule the finalize/GD path uses
+    # (_min_crew_shortfalls); advisory roles (AME / L-SH / security) never
+    # block. Unpublishing stays unrestricted.
+    shortfalls = _min_crew_shortfalls(sb, flight)
+    if shortfalls:
+        raise HTTPException(
+            status_code=422,
+            detail="لا يمكن نشر الرحلة — نقص في الطاقم الملزم: " + "؛ ".join(shortfalls),
+        )
 
     # Update flight
     updated = sb.table("flights").update({
@@ -1308,6 +1400,67 @@ def _gd_blocking_reasons(sb, flight: dict) -> list[str]:
     return reasons
 
 
+def _gd_clearance_reasons(sb, flight: dict) -> list[str]:
+    """FULL go/no-go for issuing/downloading the official GD — the scheduling
+    cycle must be COMPLETE. Checks in operator-actionable order:
+    published → REG/crew/min-complement/acceptance (_gd_blocking_reasons, the
+    same rules finalize uses — advisory roles never block) → roster finalized →
+    GD not stale → mandatory crew data (passport on file). Empty ⇒ cleared."""
+    reasons: list[str] = []
+    if (flight.get("publish_status") or "") != "published":
+        reasons.append("لا يمكن إصدار GD قبل نشر الرحلة.")
+    reasons.extend(_gd_blocking_reasons(sb, flight))
+    if flight.get("roster_finalized_status") != "finalized":
+        reasons.append("لا يمكن إصدار GD قبل اعتماد الجدول النهائي.")
+    elif flight.get("gd_status") == "stale":
+        reasons.append("تم تعديل الطاقم بعد آخر GD، يرجى إعادة الاعتماد/إعادة توليد GD.")
+    # Mandatory GD fields: every OPERATING member must have a passport on file
+    # (the form's PP NO column) — riders don't appear on the GD.
+    try:
+        asg = sb.table("assignments").select("crew_id, duty_type") \
+            .eq("flight_id", flight["id"]).execute().data or []
+        ids = [r["crew_id"] for r in asg
+               if r.get("crew_id")
+               and (r.get("duty_type") or "operating") == "operating"]
+        if ids:
+            rows = sb.table("crew").select(
+                "id, full_name_ar, full_name_en, passport_number") \
+                .in_("id", ids).execute().data or []
+            no_pp = [r.get("full_name_ar") or r.get("full_name_en") or r["id"]
+                     for r in rows
+                     if not (r.get("passport_number") or "").strip()]
+            if no_pp:
+                reasons.append("جواز السفر غير مسجّل لـ: " + "، ".join(no_pp))
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "gd passport check failed for %s", flight.get("id"))
+    return reasons
+
+
+@router.get("/{flight_id}/gd-clearance")
+async def gd_clearance(flight_id: str, current_user: CurrentUser, sb: SbClient):
+    """Central GD go/no-go. The client-side exporter MUST consult this before
+    generating (PDF and Word share one path), and log-download re-enforces it
+    server-side — no UI mistake can produce an official GD for an unpublished
+    or incomplete flight."""
+    flight_res = sb.table("flights").select("*") \
+        .eq("id", flight_id).eq("company_id", current_user["company_id"]).execute()
+    if not flight_res.data:
+        raise NotFoundError("Flight", flight_id)
+    flight = flight_res.data[0]
+    reasons = _gd_clearance_reasons(sb, flight)
+    return {
+        "flight_id": flight_id,
+        "flight_number": flight.get("flight_number"),
+        "allowed": not reasons,
+        "reasons": reasons,
+        "publish_status": flight.get("publish_status"),
+        "roster_finalized_status": flight.get("roster_finalized_status"),
+        "gd_status": flight.get("gd_status"),
+        "gd_version": flight.get("gd_version"),
+    }
+
+
 def mark_gd_stale_if_finalized(sb, company_id: str, flight_id: str, actor: Optional[dict] = None) -> None:
     """If a FINALISED flight's crew changed, flag its GD 'stale' + alert Flight
     Ops that it needs re-approval. Best-effort: never raises into the caller
@@ -1402,7 +1555,17 @@ async def regenerate_gendec(flight_id: str, current_user: CurrentUser, sb: SbCli
 async def log_gendec_download(flight_id: str, current_user: CurrentUser, sb: SbClient,
                               data: Optional[dict] = Body(default=None)):
     """Audit a GD download (the file is generated client-side). Records who
-    downloaded which format so the official document has a paper trail (#10)."""
+    downloaded which format so the official document has a paper trail (#10).
+    SERVER-side enforcement of the clearance gate lives here too — a download
+    of a blocked GD is refused with the full reasons, whatever the UI did."""
+    flight_res = sb.table("flights").select("*") \
+        .eq("id", flight_id).eq("company_id", current_user["company_id"]).execute()
+    if not flight_res.data:
+        raise NotFoundError("Flight", flight_id)
+    reasons = _gd_clearance_reasons(sb, flight_res.data[0])
+    if reasons:
+        raise HTTPException(status_code=422,
+                            detail="لا يمكن تحميل GD: " + "؛ ".join(reasons))
     fmt = str((data or {}).get("format") or "pdf").lower()
     try:
         sb.table("audit_log").insert({

@@ -117,7 +117,16 @@ def test_publish_writes_audit(monkeypatch):
                      "flight_number": "IA-229", "aircraft_registration": "YI-ASU",
                      "departure_time": "2026-06-20T10:00:00+00:00",
                      "origin_code": "BGW", "destination_code": "EBL"}],
-        "users": [], "assignments": [],
+        "users": [],
+        # Full mandatory complement — publish now enforces the min-crew gate.
+        "assignments": [{"id": f"a{i}", "flight_id": "f1", "crew_id": c,
+                         "duty_type": "operating"}
+                        for i, c in enumerate(("p1", "p2", "cc1", "cc2", "cc3"))],
+        "crew": [{"id": "p1", "rank": "captain"},
+                 {"id": "p2", "rank": "first_officer"},
+                 {"id": "cc1", "rank": "cabin_crew"},
+                 {"id": "cc2", "rank": "cabin_crew"},
+                 {"id": "cc3", "rank": "cabin_crew"}],
     }
     asyncio.run(publish_flight("f1", current_user=SCHEDULER, sb=FakeSb(store)))
     audits = _audits(store, "publish_flight")
@@ -166,7 +175,16 @@ def test_publish_still_allowed_for_specialty_scheduler(monkeypatch):
                      "flight_number": "IA-1", "aircraft_registration": "YI-ASU",
                      "departure_time": "2026-06-20T10:00:00+00:00",
                      "origin_code": "BGW", "destination_code": "EBL"}],
-        "users": [], "assignments": [],
+        "users": [],
+        # Full mandatory complement — publish now enforces the min-crew gate.
+        "assignments": [{"id": f"a{i}", "flight_id": "f1", "crew_id": c,
+                         "duty_type": "operating"}
+                        for i, c in enumerate(("p1", "p2", "cc1", "cc2", "cc3"))],
+        "crew": [{"id": "p1", "rank": "captain"},
+                 {"id": "p2", "rank": "first_officer"},
+                 {"id": "cc1", "rank": "cabin_crew"},
+                 {"id": "cc2", "rank": "cabin_crew"},
+                 {"id": "cc3", "rank": "cabin_crew"}],
     }
     res = asyncio.run(publish_flight("f1", current_user=SCHED_CAB, sb=FakeSb(store)))
     assert store["flights_updates"][0]["publish_status"] == "published" or res

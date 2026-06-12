@@ -80,3 +80,28 @@ def test_deadhead_unqualified_does_not_trigger_review():
     res = _run(store)
     assert res["crew"][0]["operating"] is False
     assert res["crew_review_required"] is False   # non-operating crew don't gate
+
+
+def test_manifest_carries_assignment_id_and_acceptance_status():
+    """The OCC drawer's Replace action needs assignment_id; the row chips need
+    the derived acceptance status (declined > admin_confirmed > accepted >
+    pending)."""
+    store = {
+        "flights": [{"id": "f1", "company_id": "c1", "aircraft_type": "A320"}],
+        "assignments": [
+            {"id": "a1", "crew_id": "cr1", "duty_type": "operating",
+             "acknowledged": False, "declined": True},
+            {"id": "a2", "crew_id": "cr2", "duty_type": "operating",
+             "acknowledged": True, "declined": False},
+            {"id": "a3", "crew_id": "cr3", "duty_type": "operating",
+             "acknowledged": False, "declined": False},
+        ],
+        "crew": [{"id": c, "full_name_ar": c, "aircraft_qualifications": ["A320"]}
+                 for c in ("cr1", "cr2", "cr3")],
+    }
+    res = _run(store)
+    by = {c["crew_id"]: c for c in res["crew"]}
+    assert by["cr1"]["assignment_id"] == "a1"
+    assert by["cr1"]["acceptance_status"] == "declined"
+    assert by["cr2"]["acceptance_status"] == "accepted"
+    assert by["cr3"]["acceptance_status"] == "pending_acceptance"
