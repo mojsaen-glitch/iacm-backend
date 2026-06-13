@@ -10,12 +10,13 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 
 from app.api.deps import SbClient, CurrentUser
 from app.core.exceptions import ForbiddenError
 from app.core.monthly_hours import _month_bounds_baghdad, _BAGHDAD
 from app.core.standby_report import compute_standby_report
+from app.core.standby_roster import generate_standby_roster_draft
 
 router = APIRouter(prefix="/reports/standby", tags=["Standby Report"])
 log = logging.getLogger(__name__)
@@ -93,3 +94,77 @@ async def standby_report(current_user: CurrentUser, sb: SbClient,
                     "standby_type": standby_type, "status": status},
     })
     return report
+
+
+# Same population that manages standby may PREVIEW a roster draft.
+_PLAN_ROLES = {"super_admin", "admin", "ops_manager", "scheduler",
+               "scheduler_admin", "crew_allocator", "cabin_allocator",
+               "cockpit_allocator", "ground_allocator",
+               "sched_captain", "sched_copilot", "sched_engineer",
+               "sched_purser", "sched_cabin", "sched_balance",
+               "sched_security", "sched_extra",
+               "flight_movement", "flight_movement_admin"}
+
+
+@router.post("/roster-draft")
+async def standby_roster_draft(data: dict, current_user: CurrentUser, sb: SbClient):
+    """R6.3 — generate a PROPOSED monthly standby roster and return it.
+    PREVIEW ONLY: persists nothing, creates no standby/assignment/callout, never
+    activates. Eligibility reuses R4 (`_standby_eligibility`); fairness reuses
+    the R6.2 per-crew load. Uncovered slots come back with reasons.
+
+    Body: {year, month, requirements: [{base, rank, standby_type?, per_day?,
+    start_hour?, end_hour?}], company_id?}.
+    """
+    if current_user.get("role") not in _PLAN_ROLES \
+            and not current_user.get("is_superuser"):
+        raise ForbiddenError("غير مصرّح بتوليد مسودة جدول الاحتياط")
+    cid = _company_for(current_user, data.get("company_id"))
+
+    now = datetime.now(timezone.utc)
+    bag_now = now + _BAGHDAD
+    y = int(data.get("year") or bag_now.year)
+    m = int(data.get("month") or bag_now.month)
+    if not (1 <= m <= 12):
+        raise HTTPException(status_code=422, detail="month يجب أن يكون 1..12")
+    requirements = data.get("requirements") or []
+    if not isinstance(requirements, list) or not requirements:
+        raise HTTPException(status_code=422,
+                            detail="requirements مطلوبة (قائمة قاعدة/رتبة/عدد)")
+
+    # Crew pool for the company (id/base/rank for matching + display).
+    crew_pool = (sb.table("crew")
+                 .select("id,full_name_ar,full_name_en,rank,base")
+                 .eq("company_id", cid).execute().data) or []
+    crew_pool = [{"id": c["id"], "base": c.get("base"), "rank": c.get("rank"),
+                  "name_ar": c.get("full_name_ar", ""),
+                  "name_en": c.get("full_name_en", "")} for c in crew_pool]
+
+    # Existing month load → fairness (reuse the R6.2 aggregation for shift counts).
+    start, end = _month_bounds_baghdad(y, m)
+    existing = []
+    try:
+        existing = (sb.table("standby_assignments").select("*")
+                    .eq("company_id", cid)
+                    .gte("start_time", start).lt("start_time", end)
+                    .execute().data) or []
+    except Exception as e:
+        log.warning("roster-draft load query failed for %s: %s", cid, e)
+    load_rep = compute_standby_report(existing, {}, now)
+    base_load = {c["crew_id"]: c["shifts"] for c in load_rep["crew"]}
+
+    # Eligibility = SAME R4 gate (no parallel logic), memoised per (crew, window).
+    from app.api.v1.endpoints.standby import _standby_eligibility
+    _cache: dict = {}
+
+    def is_eligible(crew_id, s_iso, e_iso):
+        key = (crew_id, s_iso, e_iso)
+        if key not in _cache:
+            _cache[key] = _standby_eligibility(sb, crew_id, s_iso, e_iso)
+        return _cache[key]
+
+    draft = generate_standby_roster_draft(
+        year=y, month=m, requirements=requirements,
+        crew_pool=crew_pool, base_load=base_load, is_eligible=is_eligible)
+    draft["company_id"] = cid
+    return draft
