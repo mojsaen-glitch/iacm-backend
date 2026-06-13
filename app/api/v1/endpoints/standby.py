@@ -6,15 +6,20 @@ endpoint ranks eligible standby crew for a flight using the ComplianceEngine
 (so a blocked/over-FDP reserve is never offered first).
 """
 
+import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Query, HTTPException
+from fastapi import APIRouter, Header, HTTPException
 
 from app.api.deps import CurrentUser, SbClient
+from app.core.audit import write_audit
+from app.core.config import settings
 from app.core.exceptions import NotFoundError, ForbiddenError
 from app.core.compliance_engine import ComplianceEngine, IRAQI_AIRPORTS
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/standby", tags=["Standby"])
 
@@ -34,6 +39,24 @@ _VALID_STATUS = {"ACTIVE", "CALLED_OUT", "ASSIGNED", "EXPIRED", "CANCELLED"}
 def _ensure_manager(user: dict) -> None:
     if user.get("role") not in _MANAGERS and not user.get("is_superuser"):
         raise ForbiddenError("غير مصرح بإدارة الاحتياط")
+
+
+# Maintenance actions (expiry sweep) are supervisory — same population that runs
+# the acceptance-reminder sweep.
+_SUPERVISORS = {"super_admin", "admin", "ops_manager", "scheduler_admin"}
+
+
+def _ensure_supervisor(user: dict) -> None:
+    if user.get("role") not in _SUPERVISORS and not user.get("is_superuser"):
+        raise ForbiddenError("الإدمن / مدير العمليات / مشرف الجدولة فقط")
+
+
+def _parse_dt(value):
+    """Parse an ISO timestamp; None on anything unparseable."""
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
 
 
 def _enrich(sb, company_id: str, rows: list) -> list:
@@ -107,6 +130,12 @@ async def create_standby(data: dict, current_user: CurrentUser, sb: SbClient):
         res = sb.table("standby_assignments").insert(row).execute()
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"تعذّر إنشاء الاحتياط: {str(e)[:200]}")
+
+    write_audit(sb, current_user, "standby_created", "standby", row["id"],
+                after={"crew_id": crew_id, "standby_type": st,
+                       "airport_code": row["airport_code"],
+                       "start_time": row["start_time"], "end_time": row["end_time"],
+                       "response_minutes": row["response_minutes"]})
     return res.data[0] if res.data else row
 
 
@@ -120,6 +149,7 @@ async def callout_standby(standby_id: str, data: dict, current_user: CurrentUser
         .eq("company_id", current_user["company_id"]).execute()
     if not existing.data:
         raise NotFoundError("Standby", standby_id)
+    before = existing.data[0]
 
     flight_id = data.get("flight_id")
     update = {
@@ -129,31 +159,54 @@ async def callout_standby(standby_id: str, data: dict, current_user: CurrentUser
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     res = sb.table("standby_assignments").update(update).eq("id", standby_id).execute()
+
+    write_audit(sb, current_user, "standby_called_out", "standby", standby_id,
+                before={"status": before.get("status"),
+                        "called_out": before.get("called_out"),
+                        "assigned_flight_id": before.get("assigned_flight_id")},
+                after={"status": update["status"], "called_out": True,
+                       "assigned_flight_id": flight_id})
     return res.data[0] if res.data else {}
 
 
 @router.post("/{standby_id}/cancel")
 async def cancel_standby(standby_id: str, current_user: CurrentUser, sb: SbClient):
     _ensure_manager(current_user)
-    existing = sb.table("standby_assignments").select("id").eq("id", standby_id) \
+    existing = sb.table("standby_assignments").select("*").eq("id", standby_id) \
         .eq("company_id", current_user["company_id"]).execute()
     if not existing.data:
         raise NotFoundError("Standby", standby_id)
+    before = existing.data[0]
     res = sb.table("standby_assignments").update({
         "status": "CANCELLED",
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", standby_id).execute()
+
+    write_audit(sb, current_user, "standby_cancelled", "standby", standby_id,
+                before={"status": before.get("status")},
+                after={"status": "CANCELLED"})
     return res.data[0] if res.data else {}
 
 
 @router.delete("/{standby_id}", status_code=204)
 async def delete_standby(standby_id: str, current_user: CurrentUser, sb: SbClient):
     _ensure_manager(current_user)
-    existing = sb.table("standby_assignments").select("id").eq("id", standby_id) \
+    existing = sb.table("standby_assignments").select("*").eq("id", standby_id) \
         .eq("company_id", current_user["company_id"]).execute()
     if not existing.data:
         raise NotFoundError("Standby", standby_id)
+    before = existing.data[0]
     sb.table("standby_assignments").delete().eq("id", standby_id).execute()
+
+    write_audit(sb, current_user, "standby_deleted", "standby", standby_id,
+                before=before,
+                after={"deleted_standby": {
+                    "crew_id": before.get("crew_id"),
+                    "standby_type": before.get("standby_type"),
+                    "status": before.get("status"),
+                    "start_time": before.get("start_time"),
+                    "end_time": before.get("end_time"),
+                }})
 
 
 @router.get("/suggest/{flight_id}")
@@ -167,23 +220,26 @@ async def suggest_standby(flight_id: str, current_user: CurrentUser, sb: SbClien
         raise NotFoundError("Flight", flight_id)
     flight = fl.data[0]
 
-    def _dt(s):
-        try:
-            return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
-        except Exception:
-            return None
-    dep = _dt(flight.get("departure_time"))
-    arr = _dt(flight.get("arrival_time"))
+    now = datetime.now(timezone.utc)
+    dep = _parse_dt(flight.get("departure_time"))
+    arr = _parse_dt(flight.get("arrival_time"))
     intl = (flight.get("origin_code", "").upper() not in IRAQI_AIRPORTS or
             flight.get("destination_code", "").upper() not in IRAQI_AIRPORTS)
 
     rows = sb.table("standby_assignments").select("*") \
         .eq("company_id", current_user["company_id"]).eq("status", "ACTIVE") \
         .execute().data or []
-    # Keep only reserves whose window covers the departure.
+    # Keep only ACTIVE reserves whose window covers the departure. Cancelled /
+    # called-out / assigned / expired rows are never valid candidates, and a
+    # reserve whose window already ended (relative to NOW) is treated as expired
+    # even if the periodic sweep hasn't marked it yet (lazy expiry).
     candidates = []
     for r in rows:
-        s, e = _dt(r.get("start_time")), _dt(r.get("end_time"))
+        if r.get("status") != "ACTIVE":
+            continue
+        s, e = _parse_dt(r.get("start_time")), _parse_dt(r.get("end_time"))
+        if e and e < now:
+            continue
         if dep and s and e and not (s <= dep <= e):
             continue
         candidates.append(r)
@@ -207,3 +263,68 @@ async def suggest_standby(flight_id: str, current_user: CurrentUser, sb: SbClien
         int(x.get("response_minutes") or 9999),
     ))
     return {"flight_id": flight_id, "candidates": out}
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Expiry — R0: clean, deterministic, NO escalation.
+# An ACTIVE reserve whose window has ended is stale. The sweep flips it to
+# EXPIRED (audited) so it leaves the active pool and reporting is honest.
+# It NEVER touches CALLED_OUT / ASSIGNED / CANCELLED / already-EXPIRED rows,
+# and never creates an assignment or sends a notification — those are R1/R2+.
+# ──────────────────────────────────────────────────────────────────────
+
+def _expire_company_standby(sb, company_id: str, actor: Optional[dict] = None) -> dict:
+    """Flip ACTIVE reserves past their end_time to EXPIRED for one company.
+    Idempotent: a second run finds nothing (the rows are no longer ACTIVE)."""
+    now = datetime.now(timezone.utc)
+    rows = sb.table("standby_assignments").select("*") \
+        .eq("company_id", company_id).eq("status", "ACTIVE").execute().data or []
+    expired_ids = []
+    for r in rows:
+        # Belt-and-suspenders: recording fakes ignore .eq filters, and only
+        # truly-ended ACTIVE rows may expire.
+        if r.get("status") != "ACTIVE":
+            continue
+        e = _parse_dt(r.get("end_time"))
+        if e is None or e >= now:
+            continue
+        sb.table("standby_assignments").update({
+            "status": "EXPIRED",
+            "updated_at": now.isoformat(),
+        }).eq("id", r["id"]).execute()
+        write_audit(sb, actor, "standby_expired", "standby", r["id"],
+                    before={"status": "ACTIVE", "end_time": r.get("end_time")},
+                    after={"status": "EXPIRED"},
+                    company_id=company_id)
+        expired_ids.append(r["id"])
+    return {"expired": len(expired_ids), "ids": expired_ids}
+
+
+@router.post("/expire")
+async def expire_standby_now(current_user: CurrentUser, sb: SbClient):
+    """Manual trigger (supervisors) — expire stale reserves for THIS company."""
+    _ensure_supervisor(current_user)
+    return _expire_company_standby(sb, current_user["company_id"], current_user)
+
+
+@router.get("/cron/expire", status_code=200)
+async def cron_expire_standby(sb: SbClient,
+                              authorization: Optional[str] = Header(default=None)):
+    """Scheduled trigger (Vercel Cron → GET, `Authorization: Bearer
+    $CRON_SECRET`) — expire stale reserves for EVERY active company."""
+    secret = getattr(settings, "CRON_SECRET", "") or ""
+    if not secret or authorization != f"Bearer {secret}":
+        raise ForbiddenError("Invalid cron credentials")
+    companies = (sb.table("companies").select("id")
+                 .eq("is_active", True).execute().data) or []
+    results = {}
+    for c in companies:
+        try:
+            results[c["id"]] = _expire_company_standby(
+                sb, c["id"],
+                {"id": "system", "name_en": "standby-cron", "company_id": c["id"]})
+        except Exception as e:
+            logger.warning("standby expiry cron failed for company %s: %s",
+                           c.get("id"), e)
+            results[c["id"]] = {"error": str(e)[:120]}
+    return {"companies": len(companies), "results": results}
