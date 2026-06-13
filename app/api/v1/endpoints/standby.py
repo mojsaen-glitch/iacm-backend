@@ -16,7 +16,7 @@ from fastapi import APIRouter, Header, HTTPException
 from app.api.deps import CurrentUser, SbClient
 from app.core.audit import write_audit
 from app.core.config import settings
-from app.core.exceptions import NotFoundError, ForbiddenError
+from app.core.exceptions import NotFoundError, ForbiddenError, ConflictError
 from app.core.compliance_engine import ComplianceEngine, IRAQI_AIRPORTS
 from app.services import push_service
 
@@ -128,6 +128,76 @@ def _notify_reserve_callout(sb, company_id: str, before: dict,
         logger.warning("standby callout notify failed for %s: %s",
                        before.get("id"), e)
         return {"notified": False, "reason": "error"}
+
+
+def _notify_schedulers_standby(sb, company_id: str, row: dict,
+                               kind: str, detail: Optional[str] = None) -> None:
+    """R2 — tell the schedulers/ops how a reserve responded (accepted+assigned /
+    rejected / accepted-but-assignment-failed). Fail-soft; NO escalation."""
+    try:
+        from app.api.v1.endpoints.flights import _SCHEDULER_NOTIFY_ROLES
+        urs = (sb.table("users").select("id,role")
+               .eq("company_id", company_id).eq("is_active", True)
+               .execute().data) or []
+        recipients = [u["id"] for u in urs
+                      if u.get("role") in _SCHEDULER_NOTIFY_ROLES]
+        if not recipients:
+            return
+        msgs = {
+            "rejected": (f"رفض الطاقم استدعاء الاحتياط. السبب: {detail or '—'}",
+                         f"Reserve callout rejected. Reason: {detail or '—'}"),
+            "accepted_assigned": ("قبل الطاقم استدعاء الاحتياط وتم التعيين.",
+                                  "Reserve accepted the callout and was assigned."),
+            "accept_failed": (f"قبل الطاقم الاحتياط لكن فشل التعيين: {detail or '—'}",
+                              f"Reserve accepted but assignment failed: {detail or '—'}"),
+        }
+        ar, en = msgs.get(kind, ("تحديث استدعاء احتياط", "Reserve callout update"))
+        now = datetime.now(timezone.utc).isoformat()
+        notifs = [{
+            "id": str(uuid.uuid4()),
+            "user_id": uid,
+            "type": "standby_response",
+            "title_ar": "ردّ على استدعاء احتياط",
+            "title_en": "Reserve callout response",
+            "message_ar": ar,
+            "message_en": en,
+            "reference_id": row.get("id"),
+            "reference_type": "standby",
+            "is_read": False,
+            "created_at": now,
+        } for uid in recipients]
+        sb.table("notifications").insert(notifs).execute()
+        push_service.send_to_users(
+            sb, recipients, title="ردّ على استدعاء احتياط", body=ar,
+            data={"type": "standby_response", "reference_type": "standby",
+                  "reference_id": row.get("id")})
+    except Exception as e:
+        logger.warning("standby scheduler-notify failed for %s: %s",
+                       row.get("id"), e)
+
+
+def _resolve_assigner(sb, company_id: str, user_id: Optional[str]):
+    """The responsible assigner for an accepted callout = the user who OWNS the
+    standby (its `created_by`). Returns a current_user-shaped dict only if that
+    user exists in this company AND holds an assigner role — otherwise None, so
+    the caller surfaces a clear failure instead of silently elevating anyone."""
+    if not user_id:
+        return None
+    from app.api.v1.endpoints.assignments import _ASSIGNERS
+    urs = (sb.table("users")
+           .select("id,role,name_ar,name_en,email,crew_id,crew_department,is_superuser")
+           .eq("id", user_id).eq("company_id", company_id).execute().data) or []
+    if not urs:
+        return None
+    u = urs[0]
+    if u.get("role") not in _ASSIGNERS and not u.get("is_superuser"):
+        return None
+    return {
+        "id": u["id"], "role": u.get("role"), "company_id": company_id,
+        "name_ar": u.get("name_ar"), "name_en": u.get("name_en"),
+        "email": u.get("email"), "crew_department": u.get("crew_department"),
+        "is_superuser": bool(u.get("is_superuser")),
+    }
 
 
 def _enrich(sb, company_id: str, rows: list) -> list:
@@ -244,6 +314,143 @@ async def callout_standby(standby_id: str, data: dict, current_user: CurrentUser
     if not before.get("called_out") and before.get("status") == "ACTIVE":
         _notify_reserve_callout(sb, current_user["company_id"], before, flight_id)
     return res.data[0] if res.data else {}
+
+
+@router.post("/{standby_id}/respond")
+async def respond_standby(standby_id: str, data: dict,
+                          current_user: CurrentUser, sb: SbClient):
+    """R2 — the called-out reserve's own answer: accept | reject (with reason).
+
+    On ACCEPT the assignment is created through the EXISTING `assign_crew`
+    path — there is NO parallel assignment route, so every safety gate
+    (qualification / documents / training / conflict / rest / FDP-FTL / DNP)
+    and the existing assignment audit apply unchanged. Acceptance is recorded
+    first, but is NOT a successful tasking until `assignment_id` is set; if the
+    gate blocks, `assignment_error` records why and the call returns an error.
+
+    Idempotent: re-accepting a linked callout returns the same assignment;
+    re-rejecting returns the stored rejection. NO escalation here (that's R3).
+    """
+    # Crew-facing: only the crew member the callout is FOR may respond.
+    if current_user.get("role") != "crew":
+        raise ForbiddenError("هذه النقطة لردّ أفراد الطاقم على الاستدعاء فقط")
+    action = str(data.get("action") or "").strip().lower()
+    if action not in ("accept", "reject"):
+        raise HTTPException(status_code=422,
+                            detail="action يجب أن يكون accept أو reject")
+    reason = str(data.get("reason") or "").strip()[:300]
+    if action == "reject" and not reason:
+        raise HTTPException(status_code=422, detail="سبب الرفض مطلوب")
+
+    company_id = current_user["company_id"]
+    existing = sb.table("standby_assignments").select("*").eq("id", standby_id) \
+        .eq("company_id", company_id).execute()
+    if not existing.data:                       # also blocks cross-company access
+        raise NotFoundError("Standby", standby_id)
+    row = existing.data[0]
+    if current_user.get("crew_id") != row.get("crew_id"):
+        raise ForbiddenError("لا يمكنك الرد على استدعاء فرد آخر")
+    if not row.get("called_out") or row.get("status") not in ("CALLED_OUT", "ASSIGNED"):
+        raise HTTPException(status_code=409, detail="لا يوجد استدعاء فعّال للرد عليه")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    prev = row.get("response_status")
+
+    # ── REJECT ───────────────────────────────────────────────────────────────
+    if action == "reject":
+        if prev == "REJECTED":                  # idempotent
+            return {"ok": True, "response_status": "REJECTED",
+                    "responded_at": row.get("responded_at")}
+        if prev == "ACCEPTED":
+            raise HTTPException(status_code=409,
+                                detail="سبق قبول هذا الاستدعاء — لا يمكن رفضه")
+        sb.table("standby_assignments").update({
+            "response_status": "REJECTED", "response_reason": reason,
+            "responded_at": now_iso, "updated_at": now_iso,
+        }).eq("id", standby_id).execute()
+        write_audit(sb, current_user, "standby_response", "standby", standby_id,
+                    before={"response_status": prev},
+                    after={"response_status": "REJECTED", "action": "reject"},
+                    reason=reason)
+        _notify_schedulers_standby(sb, company_id, row, "rejected", reason)
+        return {"ok": True, "response_status": "REJECTED", "responded_at": now_iso}
+
+    # ── ACCEPT ───────────────────────────────────────────────────────────────
+    if prev == "ACCEPTED" and row.get("assignment_id"):   # idempotent success
+        return {"ok": True, "response_status": "ACCEPTED",
+                "assignment_id": row.get("assignment_id"),
+                "responded_at": row.get("responded_at")}
+    if prev == "REJECTED":
+        raise HTTPException(status_code=409, detail="سبق رفض هذا الاستدعاء")
+    flight_id = row.get("assigned_flight_id")
+    if not flight_id:
+        raise HTTPException(status_code=422,
+                            detail="لا توجد رحلة مرتبطة بالاستدعاء للتعيين")
+
+    # Record acceptance FIRST (so the intent + time are stored even if the
+    # downstream assignment later fails). Acceptance ≠ tasking yet.
+    if prev != "ACCEPTED":
+        sb.table("standby_assignments").update({
+            "response_status": "ACCEPTED", "response_reason": None,
+            "responded_at": now_iso, "updated_at": now_iso,
+        }).eq("id", standby_id).execute()
+        write_audit(sb, current_user, "standby_response", "standby", standby_id,
+                    before={"response_status": prev},
+                    after={"response_status": "ACCEPTED", "action": "accept"})
+
+    # The assignment is performed by the standby OWNER (a scheduler/ops), never
+    # by elevating the crew member. If they can't assign, fail loudly.
+    assigner = _resolve_assigner(sb, company_id, row.get("created_by"))
+    if assigner is None:
+        err = "تعذّر التعيين: مُصدِر الاحتياط غير متاح أو لا يملك صلاحية التعيين"
+        sb.table("standby_assignments").update(
+            {"assignment_error": err, "updated_at": now_iso}).eq("id", standby_id).execute()
+        write_audit(sb, current_user, "standby_assign_failed", "standby", standby_id,
+                    after={"error": err})
+        _notify_schedulers_standby(sb, company_id, row, "accept_failed", err)
+        raise HTTPException(status_code=409, detail=err)
+
+    # SAME path as a manual assignment — all gates + the assignment audit run.
+    from app.api.v1.endpoints.assignments import assign_crew
+    try:
+        saved = await assign_crew(
+            {"flight_id": flight_id, "crew_id": row["crew_id"],
+             "duty_type": "operating"},
+            current_user=assigner, sb=sb)
+    except ConflictError:
+        # Already assigned (e.g. a retry after the assignment was created but
+        # before we linked it) — find it and link. No duplicate is created.
+        ex = (sb.table("assignments").select("id")
+              .eq("flight_id", flight_id).eq("crew_id", row["crew_id"])
+              .execute().data) or []
+        aid = ex[0]["id"] if ex else None
+        sb.table("standby_assignments").update({
+            "assignment_id": aid, "assignment_error": None,
+            "status": "ASSIGNED", "updated_at": now_iso,
+        }).eq("id", standby_id).execute()
+        return {"ok": True, "response_status": "ACCEPTED",
+                "assignment_id": aid, "idempotent": True}
+    except Exception as e:
+        detail = getattr(e, "detail", None) or str(e)
+        detail = str(detail)[:300]
+        sb.table("standby_assignments").update(
+            {"assignment_error": detail, "updated_at": now_iso}).eq("id", standby_id).execute()
+        write_audit(sb, current_user, "standby_assign_failed", "standby", standby_id,
+                    after={"error": detail})
+        _notify_schedulers_standby(sb, company_id, row, "accept_failed", detail)
+        raise HTTPException(
+            status_code=409, detail=f"قُبِل الاستدعاء لكن تعذّر التعيين: {detail}")
+
+    # Success — link the created assignment, clear any prior error.
+    sb.table("standby_assignments").update({
+        "assignment_id": saved.get("id"), "assignment_error": None,
+        "status": "ASSIGNED", "updated_at": now_iso,
+    }).eq("id", standby_id).execute()
+    write_audit(sb, current_user, "standby_assigned", "standby", standby_id,
+                after={"assignment_id": saved.get("id"), "flight_id": flight_id})
+    _notify_schedulers_standby(sb, company_id, row, "accepted_assigned")
+    return {"ok": True, "response_status": "ACCEPTED",
+            "assignment_id": saved.get("id")}
 
 
 @router.post("/{standby_id}/cancel")
