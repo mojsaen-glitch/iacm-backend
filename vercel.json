@@ -27,7 +27,7 @@
     },
     {
       "path": "/api/v1/standby/cron/escalate",
-      "schedule": "*/15 * * * *"
+      "schedule": "45 4 * * *"
     }
   ]
 }
