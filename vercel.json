@@ -24,6 +24,10 @@
     {
       "path": "/api/v1/standby/cron/expire",
       "schedule": "30 4 * * *"
+    },
+    {
+      "path": "/api/v1/standby/cron/escalate",
+      "schedule": "*/15 * * * *"
     }
   ]
 }

@@ -8,7 +8,7 @@ endpoint ranks eligible standby crew for a flight using the ComplianceEngine
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException
@@ -150,6 +150,9 @@ def _notify_schedulers_standby(sb, company_id: str, row: dict,
                                   "Reserve accepted the callout and was assigned."),
             "accept_failed": (f"قبل الطاقم الاحتياط لكن فشل التعيين: {detail or '—'}",
                               f"Reserve accepted but assignment failed: {detail or '—'}"),
+            "escalation_exhausted": (
+                f"لا يوجد احتياط صالح للرحلة {detail or '—'} — يلزم تدخّل يدوي.",
+                f"No valid reserve for flight {detail or '—'} — manual action needed."),
         }
         ar, en = msgs.get(kind, ("تحديث استدعاء احتياط", "Reserve callout update"))
         now = datetime.now(timezone.utc).isoformat()
@@ -293,11 +296,13 @@ async def callout_standby(standby_id: str, data: dict, current_user: CurrentUser
     before = existing.data[0]
 
     flight_id = data.get("flight_id")
+    _now_iso = datetime.now(timezone.utc).isoformat()
     update = {
         "called_out": True,
         "status":     "ASSIGNED" if flight_id else "CALLED_OUT",
         "assigned_flight_id": flight_id,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "called_out_at": _now_iso,   # R3: anchors the no-response timeout
+        "updated_at": _now_iso,
     }
     res = sb.table("standby_assignments").update(update).eq("id", standby_id).execute()
 
@@ -493,17 +498,14 @@ async def delete_standby(standby_id: str, current_user: CurrentUser, sb: SbClien
                 }})
 
 
-@router.get("/suggest/{flight_id}")
-async def suggest_standby(flight_id: str, current_user: CurrentUser, sb: SbClient):
-    """Rank ACTIVE standby crew for a flight: compliant (incl. FDP) first,
-    then by fastest response time. Used when a flight is short-crewed."""
-    _ensure_manager(current_user)
-    fl = sb.table("flights").select("*").eq("id", flight_id) \
-        .eq("company_id", current_user["company_id"]).execute()
-    if not fl.data:
-        raise NotFoundError("Flight", flight_id)
-    flight = fl.data[0]
+def _rank_standby_candidates(sb, company_id: str, flight: dict) -> list:
+    """ACTIVE reserves eligible for `flight`, ranked compliant (incl. FDP) first
+    then by fastest response. Shared by GET /suggest and the R3 escalation sweep.
 
+    Excludes any row that is not ACTIVE — so cancelled / called-out / assigned /
+    expired / rejected reserves are never candidates — and treats a reserve whose
+    window already ended (relative to NOW) as expired (lazy expiry)."""
+    flight_id = flight.get("id")
     now = datetime.now(timezone.utc)
     dep = _parse_dt(flight.get("departure_time"))
     arr = _parse_dt(flight.get("arrival_time"))
@@ -511,12 +513,7 @@ async def suggest_standby(flight_id: str, current_user: CurrentUser, sb: SbClien
             flight.get("destination_code", "").upper() not in IRAQI_AIRPORTS)
 
     rows = sb.table("standby_assignments").select("*") \
-        .eq("company_id", current_user["company_id"]).eq("status", "ACTIVE") \
-        .execute().data or []
-    # Keep only ACTIVE reserves whose window covers the departure. Cancelled /
-    # called-out / assigned / expired rows are never valid candidates, and a
-    # reserve whose window already ended (relative to NOW) is treated as expired
-    # even if the periodic sweep hasn't marked it yet (lazy expiry).
+        .eq("company_id", company_id).eq("status", "ACTIVE").execute().data or []
     candidates = []
     for r in rows:
         if r.get("status") != "ACTIVE":
@@ -530,7 +527,7 @@ async def suggest_standby(flight_id: str, current_user: CurrentUser, sb: SbClien
 
     engine = ComplianceEngine(sb)
     out = []
-    for r in _enrich(sb, current_user["company_id"], candidates):
+    for r in _enrich(sb, company_id, candidates):
         result = engine.check_crew(
             crew_id=r["crew_id"], flight_id=flight_id,
             flight_departure=dep, flight_arrival=arr, is_international=intl,
@@ -541,12 +538,24 @@ async def suggest_standby(flight_id: str, current_user: CurrentUser, sb: SbClien
             "compliance_status": result.get("status"),
             "blocking_reasons":  result.get("blocking_reasons", []),
         })
-    # Compliant first, then fastest response.
     out.sort(key=lambda x: (
         0 if x.get("compliance_status") not in ("BLOCKED", "RED") else 1,
         int(x.get("response_minutes") or 9999),
     ))
-    return {"flight_id": flight_id, "candidates": out}
+    return out
+
+
+@router.get("/suggest/{flight_id}")
+async def suggest_standby(flight_id: str, current_user: CurrentUser, sb: SbClient):
+    """Rank ACTIVE standby crew for a flight: compliant (incl. FDP) first,
+    then by fastest response time. Used when a flight is short-crewed."""
+    _ensure_manager(current_user)
+    fl = sb.table("flights").select("*").eq("id", flight_id) \
+        .eq("company_id", current_user["company_id"]).execute()
+    if not fl.data:
+        raise NotFoundError("Flight", flight_id)
+    return {"flight_id": flight_id,
+            "candidates": _rank_standby_candidates(sb, current_user["company_id"], fl.data[0])}
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -609,6 +618,128 @@ async def cron_expire_standby(sb: SbClient,
                 {"id": "system", "name_en": "standby-cron", "company_id": c["id"]})
         except Exception as e:
             logger.warning("standby expiry cron failed for company %s: %s",
+                           c.get("id"), e)
+            results[c["id"]] = {"error": str(e)[:120]}
+    return {"companies": len(companies), "results": results}
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Escalation — R3: a callout that was REJECTED or NOT ANSWERED in time moves
+# to the next candidate. NO direct assignment here — only a callout (acceptance
+# + assignment still flow through R2 → /assignments). Idempotent: a processed
+# failed-callout is stamped `escalated_at` so repeated runs never re-escalate
+# or re-notify, and the next candidate (now CALLED_OUT) is never re-picked.
+# ──────────────────────────────────────────────────────────────────────
+
+def _needs_escalation(r: dict, now: datetime) -> Optional[str]:
+    """Return the trigger ('rejected' | 'timeout') if this called-out reserve
+    needs escalation, else None. A real R2 acceptance (assignment_id set) and an
+    accepted-but-failed row (response ACCEPTED) are deliberately NOT escalated."""
+    if r.get("status") not in ("CALLED_OUT", "ASSIGNED"):
+        return None
+    if not r.get("called_out") or r.get("assignment_id") or r.get("escalated_at"):
+        return None
+    resp = r.get("response_status")
+    if resp == "REJECTED":
+        return "rejected"
+    if resp is None:
+        co = _parse_dt(r.get("called_out_at"))
+        if co is not None:
+            deadline = co + timedelta(minutes=int(r.get("response_minutes") or 60))
+            if now > deadline:
+                return "timeout"
+    return None
+
+
+def _escalate_company_standby(sb, company_id: str, actor: Optional[dict] = None) -> dict:
+    """Escalate every failed callout for one company. Each failed callout is
+    stamped once (idempotent) and moves to the single best COMPLIANT ACTIVE
+    candidate for its flight (reusing the suggest ranking). If none remain, the
+    schedulers/ops are alerted exactly once."""
+    now = datetime.now(timezone.utc)
+    rows = (sb.table("standby_assignments").select("*")
+            .eq("company_id", company_id).execute().data) or []
+    escalated, exhausted = [], []
+    for r in rows:
+        trigger = _needs_escalation(r, now)
+        if trigger is None:
+            continue
+        flight_id = r.get("assigned_flight_id")
+        flight_obj = None
+        if flight_id:
+            fl = (sb.table("flights").select("*").eq("id", flight_id)
+                  .eq("company_id", company_id).execute().data) or []
+            flight_obj = fl[0] if fl else None
+        candidate = None
+        if flight_obj:
+            ranked = _rank_standby_candidates(sb, company_id, flight_obj)
+            compliant = [c for c in ranked
+                         if c.get("compliance_status") not in ("BLOCKED", "RED")]
+            candidate = compliant[0] if compliant else None
+
+        # Stamp the failed callout FIRST so a re-run never reprocesses it.
+        sb.table("standby_assignments").update({
+            "escalated_at": now.isoformat(),
+            "escalation_status": "ESCALATED" if candidate else "EXHAUSTED",
+            "updated_at": now.isoformat(),
+        }).eq("id", r["id"]).execute()
+        write_audit(sb, actor, "standby_escalated", "standby", r["id"],
+                    before={"response_status": r.get("response_status")},
+                    after={"trigger": trigger, "flight_id": flight_id,
+                           "next_standby_id": candidate.get("id") if candidate else None,
+                           "next_crew_id": candidate.get("crew_id") if candidate else None},
+                    company_id=company_id)
+
+        if candidate:
+            cid = candidate["id"]
+            sb.table("standby_assignments").update({
+                "called_out": True,
+                "status": "ASSIGNED" if flight_id else "CALLED_OUT",
+                "called_out_at": now.isoformat(),
+                "assigned_flight_id": flight_id,
+                "updated_at": now.isoformat(),
+            }).eq("id", cid).execute()
+            # Reuse R1: notify the next reserve they've been called out.
+            _notify_reserve_callout(sb, company_id, candidate, flight_id)
+            escalated.append({"from": r["id"], "to": cid})
+        else:
+            flabel = (flight_obj or {}).get("flight_number") or flight_id or "—"
+            write_audit(sb, actor, "standby_escalation_exhausted", "standby", r["id"],
+                        after={"trigger": trigger, "flight_id": flight_id},
+                        company_id=company_id)
+            _notify_schedulers_standby(sb, company_id, r, "escalation_exhausted", flabel)
+            exhausted.append(r["id"])
+
+    return {"escalated": len(escalated), "exhausted": len(exhausted),
+            "details": {"escalated": escalated, "exhausted_ids": exhausted}}
+
+
+@router.post("/escalate")
+async def escalate_standby_now(current_user: CurrentUser, sb: SbClient):
+    """Manual trigger (supervisors) — escalate failed callouts for THIS company."""
+    _ensure_supervisor(current_user)
+    return _escalate_company_standby(sb, current_user["company_id"], current_user)
+
+
+@router.get("/cron/escalate", status_code=200)
+async def cron_escalate_standby(sb: SbClient,
+                                authorization: Optional[str] = Header(default=None)):
+    """Scheduled trigger (Vercel Cron → GET, `Authorization: Bearer
+    $CRON_SECRET`) — escalate failed callouts for EVERY active company."""
+    secret = getattr(settings, "CRON_SECRET", "") or ""
+    if not secret or authorization != f"Bearer {secret}":
+        raise ForbiddenError("Invalid cron credentials")
+    companies = (sb.table("companies").select("id")
+                 .eq("is_active", True).execute().data) or []
+    results = {}
+    for c in companies:
+        try:
+            results[c["id"]] = _escalate_company_standby(
+                sb, c["id"],
+                {"id": "system", "name_en": "standby-escalation-cron",
+                 "company_id": c["id"]})
+        except Exception as e:
+            logger.warning("standby escalation cron failed for company %s: %s",
                            c.get("id"), e)
             results[c["id"]] = {"error": str(e)[:120]}
     return {"companies": len(companies), "results": results}
