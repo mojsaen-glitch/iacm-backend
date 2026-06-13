@@ -18,6 +18,7 @@ from app.core.audit import write_audit
 from app.core.config import settings
 from app.core.exceptions import NotFoundError, ForbiddenError
 from app.core.compliance_engine import ComplianceEngine, IRAQI_AIRPORTS
+from app.services import push_service
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,76 @@ def _parse_dt(value):
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except Exception:
         return None
+
+
+def _notify_reserve_callout(sb, company_id: str, before: dict,
+                            flight_id: Optional[str]) -> dict:
+    """R1 — tell the reserve crew member they've been called out: an in-app
+    notification + a best-effort push.
+
+    FAIL-SOFT by construction: this never raises into callout, push delivery is
+    delegated to push_service (which itself never raises and tolerates a missing
+    device token), and the in-app row is written BEFORE the push so a push
+    failure can't lose the in-app message. Company-scoped: the recipient user is
+    resolved within `company_id`. R1 adds NO accept/reject, NO assignment
+    bridge, NO escalation — purely an alert."""
+    try:
+        crew_id = before.get("crew_id")
+        if not crew_id:
+            return {"notified": False, "reason": "no_crew"}
+        urs = (sb.table("users").select("id,crew_id")
+               .eq("company_id", company_id).eq("is_active", True)
+               .eq("crew_id", crew_id).execute().data) or []
+        uid = urs[0]["id"] if urs else None
+        if not uid:                       # crew member has no login account
+            return {"notified": False, "reason": "no_user"}
+
+        flight_num = None
+        if flight_id:
+            fr = (sb.table("flights").select("flight_number")
+                  .eq("id", flight_id).eq("company_id", company_id)
+                  .execute().data) or []
+            if fr:
+                flight_num = fr[0].get("flight_number")
+
+        airport = before.get("airport_code")
+        start, end = before.get("start_time"), before.get("end_time")
+        bits_ar = ["تم استدعاؤك كاحتياط."]
+        bits_en = ["You have been called out as reserve."]
+        if flight_num:
+            bits_ar.append(f"الرحلة: {flight_num}.")
+            bits_en.append(f"Flight: {flight_num}.")
+        if airport:
+            bits_ar.append(f"المطار/القاعدة: {airport}.")
+            bits_en.append(f"Airport/base: {airport}.")
+        if start and end:
+            bits_ar.append(f"الاحتياط من {start} إلى {end}.")
+            bits_en.append(f"Standby {start} → {end}.")
+        msg_ar, msg_en = " ".join(bits_ar), " ".join(bits_en)
+
+        sb.table("notifications").insert({
+            "id": str(uuid.uuid4()),
+            "user_id": uid,
+            "type": "standby_callout",
+            "title_ar": "استدعاء احتياط",
+            "title_en": "Reserve call-out",
+            "message_ar": msg_ar,
+            "message_en": msg_en,
+            "reference_id": before.get("id"),
+            "reference_type": "standby",
+            "is_read": False,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+
+        push_service.send_to_users(
+            sb, [uid], title="استدعاء احتياط", body=msg_ar,
+            data={"type": "standby_callout", "reference_type": "standby",
+                  "reference_id": before.get("id")})
+        return {"notified": True, "user_id": uid}
+    except Exception as e:
+        logger.warning("standby callout notify failed for %s: %s",
+                       before.get("id"), e)
+        return {"notified": False, "reason": "error"}
 
 
 def _enrich(sb, company_id: str, rows: list) -> list:
@@ -166,6 +237,12 @@ async def callout_standby(standby_id: str, data: dict, current_user: CurrentUser
                         "assigned_flight_id": before.get("assigned_flight_id")},
                 after={"status": update["status"], "called_out": True,
                        "assigned_flight_id": flight_id})
+
+    # R1: notify the reserve — ONCE, only on the real ACTIVE→called transition.
+    # A retry finds called_out already True; a cancelled/expired reserve isn't
+    # ACTIVE — neither re-notifies. Fail-soft: notify never breaks the callout.
+    if not before.get("called_out") and before.get("status") == "ACTIVE":
+        _notify_reserve_callout(sb, current_user["company_id"], before, flight_id)
     return res.data[0] if res.data else {}
 
 
