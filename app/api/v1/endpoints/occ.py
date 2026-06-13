@@ -44,6 +44,20 @@ _DELAY_REASON_CODES = {
 _AIRCRAFT_CHANGE_REASONS = {
     "maintenance", "aog", "capacity", "swap", "operational", "other",
 }
+
+
+def _allowed_codes(sb, company_id: str, key: str, fallback: set) -> set:
+    """Per-company allowed reason codes (batch 3). The settings value is a list;
+    any missing/malformed value falls open to the `fallback` constant set so
+    behaviour is unchanged without a settings row. Codes are matched lowercase
+    (the endpoint already lowercases the incoming code)."""
+    try:
+        from app.core.company_settings import get_company_setting
+        val = get_company_setting(sb, company_id, key)
+        codes = {str(c).strip().lower() for c in val if str(c).strip()}
+        return codes or set(fallback)
+    except Exception:
+        return set(fallback)
 # Roles to alert when an aircraft change leaves crew un-rated (must review/replace).
 _CREW_REVIEW_ROLES = {
     "super_admin", "admin", "ops_manager",
@@ -374,9 +388,13 @@ async def occ_delay_flight(flight_id: str, data: dict, current_user: CurrentUser
     reason_code = str(data.get("reason_code") or "").strip().lower()
     if not reason_code:
         raise HTTPException(status_code=422, detail="سبب التأخير (reason_code) مطلوب")
-    if reason_code not in _DELAY_REASON_CODES:
+    # Per-company override (ops.delay.reason_codes); falls back to the constant
+    # when unset/unreadable so behaviour is unchanged without a settings row.
+    allowed_delay = _allowed_codes(sb, current_user["company_id"],
+                                   "ops.delay.reason_codes", _DELAY_REASON_CODES)
+    if reason_code not in allowed_delay:
         raise HTTPException(status_code=422,
-                            detail=f"سبب التأخير يجب أن يكون أحد: {', '.join(sorted(_DELAY_REASON_CODES))}")
+                            detail=f"سبب التأخير يجب أن يكون أحد: {', '.join(sorted(allowed_delay))}")
     notes = str(data.get("notes") or "").strip()[:500]
 
     delay_minutes = int(round((etd - std).total_seconds() / 60))
@@ -518,9 +536,13 @@ async def occ_change_aircraft(flight_id: str, data: dict, current_user: CurrentU
     reason_code = str(data.get("reason_code") or "").strip().lower()
     if not reason_code:
         raise HTTPException(status_code=422, detail="سبب التغيير (reason_code) مطلوب")
-    if reason_code not in _AIRCRAFT_CHANGE_REASONS:
+    # Per-company override (ops.aircraft_change.reason_codes); constant fallback.
+    allowed_change = _allowed_codes(sb, current_user["company_id"],
+                                    "ops.aircraft_change.reason_codes",
+                                    _AIRCRAFT_CHANGE_REASONS)
+    if reason_code not in allowed_change:
         raise HTTPException(status_code=422,
-                            detail=f"سبب التغيير يجب أن يكون أحد: {', '.join(sorted(_AIRCRAFT_CHANGE_REASONS))}")
+                            detail=f"سبب التغيير يجب أن يكون أحد: {', '.join(sorted(allowed_change))}")
     notes = str(data.get("notes") or "").strip()[:500]
 
     now_iso = datetime.now(timezone.utc).isoformat()
