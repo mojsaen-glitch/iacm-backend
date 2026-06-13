@@ -203,6 +203,47 @@ def _resolve_assigner(sb, company_id: str, user_id: Optional[str]):
     }
 
 
+def _standby_eligibility(sb, crew_id: str, start, end):
+    """R4 — run the EXISTING ComplianceEngine over the standby window (no
+    parallel logic). Returns (hard_reasons, warnings):
+
+      • hard_reasons — non-overridable BLOCKING issues: crew blocked/inactive,
+        expired documents / training, time conflict (already on a flight in the
+        window), missing aircraft type rating, or an engine self-error. A
+        standby with any of these must NOT be created ACTIVE.
+      • warnings — the FTL family (rest / FDP / accumulated hours) plus every
+        WARNING/CRITICAL issue. Advisory ONLY: no override is opened at standby
+        creation, and the real FTL/FDP gate runs again at R2 accept through
+        /assignments.
+
+    The HARD-vs-overridable split reuses assignments._is_overridable_block — the
+    same rule the assignment path uses — so standby and assignment stay aligned.
+    Aircraft-qualification is checked only when a type is known (None here, since
+    a bare standby is not tied to a flight/type)."""
+    from app.api.v1.endpoints.assignments import _is_overridable_block
+    engine = ComplianceEngine(sb)
+    result = engine.check_crew(
+        crew_id=crew_id,
+        flight_departure=_parse_dt(start), flight_arrival=_parse_dt(end),
+        flight_aircraft_type=None,
+    )
+    if result.get("status") == "UNKNOWN":
+        return ([result.get("error") or "تعذّر التحقق من صلاحية الطاقم"], [])
+    hard, warns = [], []
+    for i in result.get("issues", []):
+        msg = i.get("message_ar") or i.get("message_en") or i.get("rule", "")
+        if not msg:
+            continue
+        if i.get("is_blocking"):
+            if _is_overridable_block(i.get("rule", "")):
+                warns.append(msg)               # FTL family → advisory for standby
+            else:
+                hard.append(msg)                # hard block → reject
+        elif i.get("severity") in ("WARNING", "CRITICAL"):
+            warns.append(msg)                   # surface; skip pure INFO noise
+    return (hard, warns)
+
+
 def _enrich(sb, company_id: str, rows: list) -> list:
     """Attach crew name/rank to each standby row for display."""
     crew_ids = list({r["crew_id"] for r in rows if r.get("crew_id")})
@@ -250,6 +291,17 @@ async def create_standby(data: dict, current_user: CurrentUser, sb: SbClient):
     if not crew.data:
         raise NotFoundError("Crew member", crew_id)
 
+    # R4 — compliance gate at creation. A crew member that is blocked/inactive,
+    # has expired documents/training, a missing type rating, or a clear time
+    # conflict in the window is NOT created as an ACTIVE reserve. FTL/FDP/rest
+    # surface as warnings only (no override here; the real gate runs at accept).
+    hard, warns = _standby_eligibility(
+        sb, crew_id, data["start_time"], data["end_time"])
+    if hard:
+        raise HTTPException(
+            status_code=409,
+            detail="تعذّر إنشاء الاحتياط — الطاقم غير صالح: " + "؛ ".join(hard))
+
     st = (data.get("standby_type") or "AIRPORT_STANDBY").upper()
     if st not in _VALID_TYPES:
         st = "AIRPORT_STANDBY"
@@ -279,8 +331,11 @@ async def create_standby(data: dict, current_user: CurrentUser, sb: SbClient):
                 after={"crew_id": crew_id, "standby_type": st,
                        "airport_code": row["airport_code"],
                        "start_time": row["start_time"], "end_time": row["end_time"],
-                       "response_minutes": row["response_minutes"]})
-    return res.data[0] if res.data else row
+                       "response_minutes": row["response_minutes"],
+                       "warnings": warns})
+    saved = res.data[0] if res.data else row
+    # Advisory FTL/FDP/expiring-soon notes — created anyway, surfaced to caller.
+    return {**saved, "warnings": warns}
 
 
 @router.post("/{standby_id}/callout")
