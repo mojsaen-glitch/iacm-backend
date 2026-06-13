@@ -613,6 +613,71 @@ async def suggest_standby(flight_id: str, current_user: CurrentUser, sb: SbClien
             "candidates": _rank_standby_candidates(sb, current_user["company_id"], fl.data[0])}
 
 
+def _standby_state(row: dict, now: datetime) -> str:
+    """Display state of one standby row for the OCC coverage view. Terminal
+    lifecycle first, then the response outcome, then the live callout state.
+    AVAILABLE = an ACTIVE reserve that hasn't been called out yet."""
+    status = row.get("status")
+    if status == "EXPIRED":
+        return "EXPIRED"
+    if status == "CANCELLED":
+        return "CANCELLED"
+    if row.get("escalation_status") == "EXHAUSTED":
+        return "EXHAUSTED"
+    resp = row.get("response_status")
+    if resp == "ACCEPTED":
+        return "ACCEPTED"
+    if resp == "REJECTED":
+        return "REJECTED"
+    if row.get("called_out"):
+        co = _parse_dt(row.get("called_out_at"))
+        if resp is None and co is not None:
+            deadline = co + timedelta(minutes=int(row.get("response_minutes") or 60))
+            if now > deadline:
+                return "NO_RESPONSE"
+        return "CALLED"
+    return "AVAILABLE"
+
+
+@router.get("/coverage/{flight_id}")
+async def standby_coverage(flight_id: str, current_user: CurrentUser, sb: SbClient):
+    """R5 — standby coverage for one flight (OCC view). READ-ONLY: it shows the
+    available reserve pool (same ranking as /suggest) and every reserve already
+    engaged for this flight with its state — it NEVER assigns. Acceptance +
+    assignment stay in R2 → /assignments; calling a reserve out stays in
+    POST /standby/{id}/callout."""
+    _ensure_manager(current_user)
+    company_id = current_user["company_id"]
+    fl = sb.table("flights").select("*").eq("id", flight_id) \
+        .eq("company_id", company_id).execute()
+    if not fl.data:
+        raise NotFoundError("Flight", flight_id)
+    flight = fl.data[0]
+    now = datetime.now(timezone.utc)
+
+    # Available pool: ACTIVE reserves ranked compliant-first (reused ranking).
+    candidates = _rank_standby_candidates(sb, company_id, flight)
+    available = [c for c in candidates
+                 if c.get("compliance_status") not in ("BLOCKED", "RED")]
+
+    # Reserves already engaged FOR THIS flight, each tagged with its state.
+    engaged_rows = (sb.table("standby_assignments").select("*")
+                    .eq("company_id", company_id)
+                    .eq("assigned_flight_id", flight_id).execute().data) or []
+    engaged = [{**r, "state": _standby_state(r, now)}
+               for r in _enrich(sb, company_id, engaged_rows)]
+
+    return {
+        "flight_id": flight_id,
+        "available_count": len(available),
+        "has_valid_standby": bool(available),
+        "candidates": candidates,        # full ranked list (UI shows blocked + reason)
+        "engaged": engaged,
+        "message": None if available
+        else "لا يوجد احتياط صالح متاح لهذه الرحلة — يلزم تدخّل يدوي",
+    }
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Expiry — R0: clean, deterministic, NO escalation.
 # An ACTIVE reserve whose window has ended is stale. The sweep flips it to

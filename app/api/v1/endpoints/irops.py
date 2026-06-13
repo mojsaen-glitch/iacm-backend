@@ -183,7 +183,8 @@ async def recovery_options(flight_id: str, current_user: CurrentUser, sb: SbClie
     company_id = current_user["company_id"]
 
     flight = sb.table("flights").select(
-        "id,aircraft_type,aircraft_registration,departure_time,arrival_time"
+        "id,aircraft_type,aircraft_registration,departure_time,arrival_time,"
+        "origin_code,destination_code"
     ).eq("id", flight_id).eq("company_id", company_id).execute()
     if not flight.data:
         raise HTTPException(status_code=404, detail="Flight not found")
@@ -259,10 +260,26 @@ async def recovery_options(flight_id: str, current_user: CurrentUser, sb: SbClie
         float(c.get("total_flight_hours")   or 0),
     ))
 
+    # R5 — UNIFY with the managed standby pool: read reserves FIRST, ranked by
+    # the SAME standby suggest logic (compliant incl. FDP first). The general
+    # active-crew list below stays as a fallback (when no valid reserve exists).
+    # This view never assigns — acceptance + assignment stay in R2 → /assignments.
+    standby_options = []
+    try:
+        from app.api.v1.endpoints.standby import _rank_standby_candidates
+        standby_options = _rank_standby_candidates(sb, company_id, f)
+    except Exception:
+        log.exception("standby pool ranking failed for recovery-options")
+    has_valid_standby = any(
+        c.get("compliance_status") not in ("BLOCKED", "RED") for c in standby_options)
+
     return {
         "flight": f,
         "aircraft_options": aircraft_rows[:10],
-        "crew_options":     available_crew[:20],
+        # Managed reserves first (R5); general active crew is the fallback.
+        "standby_options":   standby_options[:20],
+        "has_valid_standby": has_valid_standby,
+        "crew_options":      available_crew[:20],
     }
 
 
