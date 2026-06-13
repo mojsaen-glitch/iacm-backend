@@ -10,7 +10,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Response
 
 from app.api.deps import SbClient, CurrentUser
 from app.core.exceptions import ForbiddenError
@@ -34,28 +34,10 @@ def _company_for(current_user: dict, company_id: Optional[str]) -> str:
     return current_user["company_id"]
 
 
-@router.get("")
-async def standby_report(current_user: CurrentUser, sb: SbClient,
-                         year: Optional[int] = Query(None),
-                         month: Optional[int] = Query(None, ge=1, le=12),
-                         base: Optional[str] = Query(None),
-                         rank: Optional[str] = Query(None),
-                         standby_type: Optional[str] = Query(None),
-                         status: Optional[str] = Query(None),
-                         company_id: Optional[str] = Query(None)):
-    if current_user.get("role") not in _VIEW_ROLES \
-            and not current_user.get("is_superuser"):
-        raise ForbiddenError("غير مصرّح بعرض تقرير الاحتياط")
-    cid = _company_for(current_user, company_id)
-
-    # Default to the current BAGHDAD calendar month.
-    now = datetime.now(timezone.utc)
-    bag_now = now + _BAGHDAD
-    y = year or bag_now.year
-    m = month or bag_now.month
+def _build_report(sb, cid, y, m, base, rank, standby_type, status, now):
+    """Shared report builder — the SINGLE data path used by both the JSON
+    endpoint and the export, so their numbers are identical by construction."""
     start, end = _month_bounds_baghdad(y, m)
-
-    # Reserves whose window STARTS in the month (Baghdad), company-scoped.
     q = (sb.table("standby_assignments").select("*")
          .eq("company_id", cid)
          .gte("start_time", start).lt("start_time", end))
@@ -69,7 +51,6 @@ async def standby_report(current_user: CurrentUser, sb: SbClient,
     except Exception as e:
         log.warning("standby report query failed for %s: %s", cid, e)
 
-    # Crew lookup for name/rank/base + the optional base/rank narrowing.
     crew_ids = list({r.get("crew_id") for r in rows if r.get("crew_id")})
     crew_by_id: dict = {}
     if crew_ids:
@@ -94,6 +75,63 @@ async def standby_report(current_user: CurrentUser, sb: SbClient,
                     "standby_type": standby_type, "status": status},
     })
     return report
+
+
+def _build_roster_draft(sb, cid, y, m, requirements, now):
+    """Shared roster-draft builder (R6.3) — used by the JSON endpoint and the
+    export. PREVIEW only: persists nothing."""
+    crew_pool = (sb.table("crew")
+                 .select("id,full_name_ar,full_name_en,rank,base")
+                 .eq("company_id", cid).execute().data) or []
+    crew_pool = [{"id": c["id"], "base": c.get("base"), "rank": c.get("rank"),
+                  "name_ar": c.get("full_name_ar", ""),
+                  "name_en": c.get("full_name_en", "")} for c in crew_pool]
+
+    start, end = _month_bounds_baghdad(y, m)
+    existing = []
+    try:
+        existing = (sb.table("standby_assignments").select("*")
+                    .eq("company_id", cid)
+                    .gte("start_time", start).lt("start_time", end)
+                    .execute().data) or []
+    except Exception as e:
+        log.warning("roster-draft load query failed for %s: %s", cid, e)
+    load_rep = compute_standby_report(existing, {}, now)
+    base_load = {c["crew_id"]: c["shifts"] for c in load_rep["crew"]}
+
+    from app.api.v1.endpoints.standby import _standby_eligibility
+    _cache: dict = {}
+
+    def is_eligible(crew_id, s_iso, e_iso):
+        key = (crew_id, s_iso, e_iso)
+        if key not in _cache:
+            _cache[key] = _standby_eligibility(sb, crew_id, s_iso, e_iso)
+        return _cache[key]
+
+    draft = generate_standby_roster_draft(
+        year=y, month=m, requirements=requirements,
+        crew_pool=crew_pool, base_load=base_load, is_eligible=is_eligible)
+    draft["company_id"] = cid
+    return draft
+
+
+@router.get("")
+async def standby_report(current_user: CurrentUser, sb: SbClient,
+                         year: Optional[int] = Query(None),
+                         month: Optional[int] = Query(None, ge=1, le=12),
+                         base: Optional[str] = Query(None),
+                         rank: Optional[str] = Query(None),
+                         standby_type: Optional[str] = Query(None),
+                         status: Optional[str] = Query(None),
+                         company_id: Optional[str] = Query(None)):
+    if current_user.get("role") not in _VIEW_ROLES \
+            and not current_user.get("is_superuser"):
+        raise ForbiddenError("غير مصرّح بعرض تقرير الاحتياط")
+    cid = _company_for(current_user, company_id)
+    now = datetime.now(timezone.utc)
+    bag_now = now + _BAGHDAD
+    return _build_report(sb, cid, year or bag_now.year, month or bag_now.month,
+                         base, rank, standby_type, status, now)
 
 
 # Same population that manages standby may PREVIEW a roster draft.
@@ -131,40 +169,50 @@ async def standby_roster_draft(data: dict, current_user: CurrentUser, sb: SbClie
     if not isinstance(requirements, list) or not requirements:
         raise HTTPException(status_code=422,
                             detail="requirements مطلوبة (قائمة قاعدة/رتبة/عدد)")
+    return _build_roster_draft(sb, cid, y, m, requirements, now)
 
-    # Crew pool for the company (id/base/rank for matching + display).
-    crew_pool = (sb.table("crew")
-                 .select("id,full_name_ar,full_name_en,rank,base")
-                 .eq("company_id", cid).execute().data) or []
-    crew_pool = [{"id": c["id"], "base": c.get("base"), "rank": c.get("rank"),
-                  "name_ar": c.get("full_name_ar", ""),
-                  "name_en": c.get("full_name_en", "")} for c in crew_pool]
 
-    # Existing month load → fairness (reuse the R6.2 aggregation for shift counts).
-    start, end = _month_bounds_baghdad(y, m)
-    existing = []
-    try:
-        existing = (sb.table("standby_assignments").select("*")
-                    .eq("company_id", cid)
-                    .gte("start_time", start).lt("start_time", end)
-                    .execute().data) or []
-    except Exception as e:
-        log.warning("roster-draft load query failed for %s: %s", cid, e)
-    load_rep = compute_standby_report(existing, {}, now)
-    base_load = {c["crew_id"]: c["shifts"] for c in load_rep["crew"]}
+_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
-    # Eligibility = SAME R4 gate (no parallel logic), memoised per (crew, window).
-    from app.api.v1.endpoints.standby import _standby_eligibility
-    _cache: dict = {}
 
-    def is_eligible(crew_id, s_iso, e_iso):
-        key = (crew_id, s_iso, e_iso)
-        if key not in _cache:
-            _cache[key] = _standby_eligibility(sb, crew_id, s_iso, e_iso)
-        return _cache[key]
+@router.post("/export")
+async def standby_export(data: dict, current_user: CurrentUser, sb: SbClient):
+    """R6.4 — export the standby report (+ fairness, + optional roster-draft
+    preview) as an .xlsx workbook. READ-ONLY: builds from the SAME R6.1/R6.2/R6.3
+    data path and persists NOTHING. Only `xlsx` is supported for now (PDF is
+    deferred). If `requirements` are supplied, the Roster Draft + Uncovered
+    sheets are filled from a fresh preview; otherwise those sheets are headers
+    only. Empty month → a clean workbook with an empty Summary, never an error.
 
-    draft = generate_standby_roster_draft(
-        year=y, month=m, requirements=requirements,
-        crew_pool=crew_pool, base_load=base_load, is_eligible=is_eligible)
-    draft["company_id"] = cid
-    return draft
+    Body: {year?, month?, format?='xlsx', base?, rank?, standby_type?, status?,
+    requirements?, company_id?}.
+    """
+    if current_user.get("role") not in _VIEW_ROLES \
+            and not current_user.get("is_superuser"):
+        raise ForbiddenError("غير مصرّح بتصدير تقرير الاحتياط")
+    fmt = str(data.get("format") or "xlsx").lower()
+    if fmt != "xlsx":
+        raise HTTPException(status_code=422,
+                            detail="الصيغة المدعومة حالياً: xlsx فقط (PDF مؤجَّل)")
+    cid = _company_for(current_user, data.get("company_id"))
+    now = datetime.now(timezone.utc)
+    bag_now = now + _BAGHDAD
+    y = int(data.get("year") or bag_now.year)
+    m = int(data.get("month") or bag_now.month)
+    if not (1 <= m <= 12):
+        raise HTTPException(status_code=422, detail="month يجب أن يكون 1..12")
+
+    report = _build_report(sb, cid, y, m, data.get("base"), data.get("rank"),
+                           data.get("standby_type"), data.get("status"), now)
+
+    roster = None
+    requirements = data.get("requirements") or []
+    if isinstance(requirements, list) and requirements:
+        roster = _build_roster_draft(sb, cid, y, m, requirements, now)
+
+    from app.core.standby_export import build_standby_workbook
+    content = build_standby_workbook(report, roster)
+    filename = f"standby_{cid}_{y:04d}-{m:02d}.xlsx"
+    return Response(
+        content=content, media_type=_XLSX_MIME,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'})
