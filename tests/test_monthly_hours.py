@@ -241,6 +241,42 @@ def test_cancelled_flight_not_credited():
     assert {r["crew_id"]: r for r in m["rows"]}["c2"]["month_total"] == 0.0
 
 
+def test_matrix_leg_carries_actual_flag():
+    """ATD/ATA Phase 2 UI contract: each matrix day-cell leg exposes `actual`
+    (true when the block came from recorded ATD/ATA, false on scheduled
+    fallback) so the matrix can mark actual-sourced cells."""
+    store = _store()
+    store["flights"] += [
+        {"id": "f_act", "flight_number": "IA201", "origin_code": "BGW",
+         "destination_code": "EBL", "company_id": "co1",
+         "departure_time": "2025-08-09T08:00:00+00:00",
+         "arrival_time": "2025-08-09T10:00:00+00:00", "duration_hours": 2.0,
+         "actual_departure_time": "2025-08-09T08:10:00+00:00",
+         "actual_arrival_time": "2025-08-09T10:40:00+00:00",   # actual 2.5
+         "aircraft_type": "B737", "aircraft_id": "a1"},
+    ]
+    store["assignments"].append(
+        {"id": "a_act", "crew_id": "c1", "flight_id": "f_act", "duty_type": "operating"})
+    invalidate_matrix_cache()
+    m = build_matrix(FakeSb(store), "co1", 2025, 8, {})
+    cap = {r["crew_id"]: r for r in m["rows"]}["c1"]
+    actual_leg = cap["days"]["9"]["legs"][0]
+    scheduled_leg = cap["days"]["3"]["legs"][0]           # original f1, no ATD/ATA
+    assert actual_leg["actual"] is True
+    assert scheduled_leg["actual"] is False
+
+
+def test_statement_leg_carries_hours_source():
+    """Per-crew statement legs expose `hours_source` ('actual'|'scheduled')."""
+    store = _store()
+    store["flights"][0]["actual_departure_time"] = "2025-08-03T08:00:00+00:00"
+    store["flights"][0]["actual_arrival_time"] = "2025-08-03T11:30:00+00:00"  # 3.5
+    st = build_statement(FakeSb(store), "co1", "c1", 2025, 8)
+    by_flight = {leg["flight_id"]: leg for leg in st["legs"]}
+    assert by_flight["f1"]["hours_source"] == "actual"      # ATD/ATA present
+    assert by_flight["f2"]["hours_source"] == "scheduled"   # fallback
+
+
 def test_crew_profile_excludes_cancelled_too():
     """GET /crew/{id}/flight-hours path (crew_flight_hours) — same engine rule."""
     store = _store()
